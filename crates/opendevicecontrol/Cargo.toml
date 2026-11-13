@@ -17,7 +17,6 @@ default = []
 console = []
 
 [dependencies]
-anyhow = "1.0.104"
 crossbeam-channel = "0.5.17"
 # termination: SIGTERM and SIGHUP too (systemd stop), so devices are released.
 ctrlc = { version = "3.5.2", features = ["termination"] }
