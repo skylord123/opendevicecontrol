@@ -776,8 +776,8 @@ impl Device for NxpDevice {
                 value: ControlValue::Choice(self.dpi_stage.to_string()),
                 help: Some("Also changed by the mouse's DPI buttons.".into()),
             });
-            for s in 1..=DPI_STAGES {
-                controls.push(dpi(dpi_ctrl(s), format!("DPI stage {s}"), self.dpi[s]));
+            for (s, &value) in self.dpi.iter().enumerate().take(DPI_STAGES + 1).skip(1) {
+                controls.push(dpi(dpi_ctrl(s), format!("DPI stage {s}"), value));
             }
             controls.push(dpi(CTRL_SNIPER_DPI.into(), "Sniper DPI".into(), self.dpi[0]));
             controls.push(self.toggle(CTRL_ANGLE_SNAP, "Angle snapping", self.angle_snap, "Straightens nearly straight movements."));
