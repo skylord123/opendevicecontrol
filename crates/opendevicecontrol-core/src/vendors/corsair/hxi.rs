@@ -218,8 +218,10 @@ impl HxiPsu {
         Ok(psu)
     }
 
-    fn read(&self, c: u8) -> Result<[u8; 64]> {
-        self.io.transact(&[HDR_READ, c], 2)
+    /// Read register `c`; the reply must carry at least `need` bytes
+    /// (header included) for the caller to decode.
+    fn read(&self, c: u8, need: usize) -> Result<[u8; 64]> {
+        self.io.transact_min(&[HDR_READ, c], 2, need)
     }
 
     fn write(&self, c: u8, data: &[u8]) -> Result<()> {
@@ -227,21 +229,21 @@ impl HxiPsu {
     }
 
     fn read_linear(&self, c: u8) -> Result<f64> {
-        let r = self.read(c)?;
+        let r = self.read(c, 4)?;
         Ok(linear11::decode(u16::from_le_bytes([r[2], r[3]])))
     }
 
     fn read_byte(&self, c: u8) -> Result<u8> {
-        Ok(self.read(c)?[2])
+        Ok(self.read(c, 3)?[2])
     }
 
     fn read_u32(&self, c: u8) -> Result<u32> {
-        let r = self.read(c)?;
+        let r = self.read(c, 6)?;
         Ok(u32::from_le_bytes([r[2], r[3], r[4], r[5]]))
     }
 
     fn read_string(&self, c: u8) -> Result<String> {
-        let r = self.read(c)?;
+        let r = self.read(c, 2)?;
         let s: String = r[2..]
             .iter()
             .take_while(|&&b| b != 0)
@@ -261,11 +263,11 @@ impl HxiPsu {
     /// selects a different rail between our PAGE write and our reads, we
     /// would silently label e.g. +3.3V data as +5V. Guard against that by
     /// reading PAGE back after the reads and checking the voltage is
-    /// plausible for the rail, retrying otherwise.
-    fn read_rail(&self, page: u8) -> Result<(f64, f64, f64)> {
+    /// plausible for the rail, retrying otherwise. `None`: every attempt
+    /// read another rail's page, so there is nothing trustworthy to report.
+    fn read_rail(&self, page: u8) -> Result<Option<(f64, f64, f64)>> {
         let nominal = [12.0, 5.0, 3.3][page as usize];
-        let mut last = None;
-        for attempt in 0..6u64 {
+        settle_rail(page, nominal, |attempt| {
             if attempt > 0 {
                 // iCUE polls all rails in a ~100 ms burst; wait it out.
                 std::thread::sleep(std::time::Duration::from_millis(40 * attempt));
@@ -278,16 +280,8 @@ impl HxiPsu {
                 Ok(p) => p == page,
                 Err(_) => true, // firmware without PAGE readback
             };
-            let plausible = (v - nominal).abs() <= nominal * 0.2;
-            if page_ok && plausible {
-                return Ok((v, a, w));
-            }
-            log::debug!("rail {page}: inconsistent read (page_ok={page_ok}, {v:.3} V), retry {attempt}");
-            last = Some((v, a, w));
-        }
-        // Still inconsistent: report what we have rather than nothing; a
-        // genuinely out-of-range voltage must remain visible.
-        Ok(last.unwrap())
+            Ok(((v, a, w), page_ok))
+        })
     }
 
     fn read_limits(&mut self) {
@@ -347,23 +341,31 @@ impl Device for HxiPsu {
             }
         }
 
-        let mut rails_sum = 0.0;
+        // `None` once a rail could not be read from its own page: the sum
+        // would then be incomplete and must not stand in for the total.
+        let mut rails_sum = Some(0.0);
         for (page, key, label) in RAILS {
-            let (v, a, w) = self.read_rail(page)?;
-            rails_sum += w;
+            let Some((v, a, w)) = self.read_rail(page)? else {
+                log::debug!("rail {page}: PAGE kept changing under us, skipping this sample");
+                rails_sum = None;
+                continue;
+            };
+            rails_sum = rails_sum.map(|t| t + w);
             s.push(Sensor::new(&format!("rail_{key}_voltage"), &format!("{label} voltage"), SensorKind::Voltage, v));
             s.push(Sensor::new(&format!("rail_{key}_current"), &format!("{label} current"), SensorKind::Current, a));
             s.push(Sensor::new(&format!("rail_{key}_power"), &format!("{label} power"), SensorKind::Power, w));
         }
         self.select_rail(0)?;
 
-        // Total output power register; fall back to the rail sum if absent.
-        let pout = self.read_linear(cmd::TOTAL_POUT).unwrap_or(rails_sum);
-        let pin = self.model.estimate_input_power(pout, vin).max(pout);
-        let eff = if pin > 0.0 { (pout / pin * 100.0).clamp(0.0, 100.0) } else { 0.0 };
-        s.push(Sensor::new("output_power", "Output power", SensorKind::Power, pout));
-        s.push(Sensor::new("input_power", "Input power", SensorKind::Power, pin).estimated());
-        s.push(Sensor::new("efficiency", "Efficiency", SensorKind::Efficiency, eff).estimated());
+        // Total output power register; fall back to the rail sum if absent
+        // (and only when every rail was read from its own page).
+        if let Some(pout) = self.read_linear(cmd::TOTAL_POUT).ok().or(rails_sum) {
+            let pin = self.model.estimate_input_power(pout, vin).max(pout);
+            let eff = if pin > 0.0 { (pout / pin * 100.0).clamp(0.0, 100.0) } else { 0.0 };
+            s.push(Sensor::new("output_power", "Output power", SensorKind::Power, pout));
+            s.push(Sensor::new("input_power", "Input power", SensorKind::Power, pin).estimated());
+            s.push(Sensor::new("efficiency", "Efficiency", SensorKind::Efficiency, eff).estimated());
+        }
 
         s.push(Sensor::new("temp_vrm", "VRM temperature", SensorKind::Temperature, self.read_linear(cmd::READ_TEMPERATURE_1)?));
         s.push(Sensor::new("temp_case", "Case temperature", SensorKind::Temperature, self.read_linear(cmd::READ_TEMPERATURE_2)?));
@@ -441,6 +443,31 @@ impl Device for HxiPsu {
     }
 }
 
+/// Retry `attempt` (one PAGE select plus reads, returning the sample and
+/// whether PAGE still pointed at `page` afterwards) until the sample is from
+/// the right page and plausible. When retries run out, the last sample
+/// confirmed to come from `page` is returned even if its voltage is out of
+/// range (that must stay visible); if none was, `None`.
+fn settle_rail(
+    page: u8,
+    nominal: f64,
+    mut attempt: impl FnMut(u64) -> Result<((f64, f64, f64), bool)>,
+) -> Result<Option<(f64, f64, f64)>> {
+    let mut confirmed = None;
+    for n in 0..6u64 {
+        let ((v, a, w), page_ok) = attempt(n)?;
+        let plausible = (v - nominal).abs() <= nominal * 0.2;
+        if page_ok && plausible {
+            return Ok(Some((v, a, w)));
+        }
+        log::debug!("rail {page}: inconsistent read (page_ok={page_ok}, {v:.3} V), retry {n}");
+        if page_ok {
+            confirmed = Some((v, a, w));
+        }
+    }
+    Ok(confirmed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,6 +505,22 @@ mod tests {
         let (r, sw, log) = run(true, FanTarget::Duty(60), &[cmd::FAN_COMMAND_1, cmd::FAN_CONTROL_MODE]);
         assert!(r.is_err() && sw);
         assert_eq!(log.last(), Some(&(cmd::FAN_CONTROL_MODE, 0)));
+    }
+
+    #[test]
+    fn rail_sample_from_another_page_is_never_reported() {
+        // PAGE never matches: nothing to publish.
+        let r = settle_rail(1, 5.0, |_| Ok(((3.3, 2.0, 6.6), false))).unwrap();
+        assert_eq!(r, None);
+        // Conflicts first, then a confirmed read.
+        let r = settle_rail(1, 5.0, |n| Ok(if n < 2 { ((12.1, 20.0, 242.0), false) } else { ((5.02, 3.0, 15.0), true) })).unwrap();
+        assert_eq!(r, Some((5.02, 3.0, 15.0)));
+    }
+
+    #[test]
+    fn out_of_range_voltage_on_the_right_page_stays_visible() {
+        let r = settle_rail(1, 5.0, |n| Ok(if n % 2 == 0 { ((4.1, 1.0, 4.1), true) } else { ((12.0, 9.0, 108.0), false) })).unwrap();
+        assert_eq!(r, Some((4.1, 1.0, 4.1)));
     }
 
     #[test]

@@ -228,3 +228,24 @@ fn model_table_is_consistent() {
         assert_eq!(m.max_dpi > 0, m.kind == DeviceKind::Mouse, "{}", m.name);
     }
 }
+
+#[test]
+fn cached_control_changes_only_after_a_successful_write() {
+    struct Fake {
+        win_lock: bool,
+    }
+    let mut d = Fake { win_lock: false };
+    // The device rejects the write: the cache keeps the confirmed value.
+    let r = set_if_applied(&mut d, |d| &mut d.win_lock, true, |_| Err(Error::Unsupported { cmd: 0x07 }));
+    assert!(r.is_err());
+    assert!(!d.win_lock);
+    // The write goes through with the new value in place.
+    let mut seen = None;
+    set_if_applied(&mut d, |d| &mut d.win_lock, true, |d| {
+        seen = Some(d.win_lock);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(seen, Some(true));
+    assert!(d.win_lock);
+}

@@ -644,14 +644,15 @@ fn open_bus(api: &hidapi::HidApi, path: &CStr, first_size: usize, prefix: Option
     Err(last.unwrap_or(Error::NoReply { cmd: proto::CMD_GET }))
 }
 
-/// Vendor event interfaces (interface 2) of the same physical device.
-fn event_interfaces(api: &hidapi::HidApi, list: &[&hidapi::DeviceInfo], d: &hidapi::DeviceInfo) -> Vec<hidapi::HidDevice> {
+/// Vendor event interfaces (interface 2) of the same physical device, with
+/// `units` units of this model plugged in (see [`super::same_unit`]).
+fn event_interfaces(api: &hidapi::HidApi, list: &[&hidapi::DeviceInfo], d: &hidapi::DeviceInfo, units: usize) -> Vec<hidapi::HidDevice> {
     list.iter()
         .filter(|i| {
             i.product_id() == d.product_id()
                 && i.interface_number() == 2
                 && i.usage_page() >= 0xff00
-                && i.serial_number() == d.serial_number()
+                && super::same_unit(super::serial_of(i), super::serial_of(d), units)
                 && i.path() != d.path()
         })
         .filter_map(|i| api.open_path(i.path()).map_err(|e| log::debug!("bragi event interface: {e}")).ok())
@@ -675,7 +676,10 @@ pub(super) fn discover(
 ) {
     let held = |p: &CStr| skip_paths.iter().any(|s| s.as_c_str() == p);
     let serial = |d: &hidapi::DeviceInfo| d.serial_number().map(str::to_owned).filter(|s| !s.trim().is_empty());
-    let mut done: Vec<(u16, Option<String>)> = Vec::new();
+    // Collections of one device share (PID, serial); without a serial,
+    // (PID, interface) so that identical serial-less units stay apart.
+    let unit_key = |d: &hidapi::DeviceInfo| (d.product_id(), serial(d).unwrap_or_else(|| super::interface_key(d.path())));
+    let mut done: Vec<(u16, String)> = Vec::new();
 
     // Wired devices.
     for d in list {
@@ -684,19 +688,20 @@ pub(super) fn discover(
         if !is_command_interface(d, headset_if) {
             continue;
         }
-        let key = (d.product_id(), serial(d));
+        let key = unit_key(d);
         if done.contains(&key) {
             continue; // another collection of the same device
         }
         done.push(key);
-        let id = ids.next(model.slug);
         if held(d.path()) {
             continue;
         }
+        let id = ids.next(model.slug);
         let prefix = (model.kind == DeviceKind::Headset).then_some(0x02);
         let size = if prefix.is_some() { 63 } else { model.packet };
         let opened = open_bus(api, d.path(), size, prefix).and_then(|bus| {
-            let bus = Arc::new(bus.with_events(event_interfaces(api, list, d), false));
+            let units = super::count_units(list, |c| c.product_id() == d.product_id() && is_command_interface(c, headset_if));
+            let bus = Arc::new(bus.with_events(event_interfaces(api, list, d, units), false));
             BragiDevice::open(bus, 0, model, id.clone(), serial(d))
         });
         match opened {
@@ -713,13 +718,13 @@ pub(super) fn discover(
     }
 
     // Wireless receivers and the devices paired to them.
-    let mut done_rx: Vec<(u16, Option<String>)> = Vec::new();
+    let mut done_rx: Vec<(u16, String)> = Vec::new();
     for d in list {
         let Some(rx) = receiver_for_pid(d.product_id()) else { continue };
         if !is_command_interface(d, rx.interface) {
             continue;
         }
-        let key = (d.product_id(), serial(d));
+        let key = unit_key(d);
         if done_rx.contains(&key) {
             continue;
         }
@@ -733,7 +738,8 @@ pub(super) fn discover(
             None => {
                 let prefix = rx.headset.then_some(0x02);
                 let size = if rx.headset { 63 } else { 64 };
-                let events = if rx.headset { Vec::new() } else { event_interfaces(api, list, d) };
+                let units = super::count_units(list, |c| c.product_id() == d.product_id() && is_command_interface(c, rx.interface));
+                let events = if rx.headset { Vec::new() } else { event_interfaces(api, list, d, units) };
                 let bus = match open_bus(api, d.path(), size, prefix) {
                     Ok(b) => Arc::new(b.with_events(events, true)),
                     Err(e) => {
@@ -774,13 +780,10 @@ pub(super) fn discover(
                 continue;
             }
             let path = slot_path(d.path(), slot);
-            // A device already held keeps its id; don't query it again
-            // (a sleeping one would stall the scan).
+            // A device already held keeps its (reserved) id; don't query it
+            // again (a sleeping one would stall the scan).
             if held(&path) {
-                if let Some(slug) = known_slug(&path) {
-                    ids.next(slug);
-                    continue;
-                }
+                continue;
             }
             let pid = read_child_pid(&bus, slot).or(rx.default_child);
             let Some(model) = pid.and_then(model_for_pid) else {
@@ -788,10 +791,6 @@ pub(super) fn discover(
                 continue;
             };
             let id = ids.next(model.slug);
-            remember_slug(&path, model.slug);
-            if held(&path) {
-                continue;
-            }
             match BragiDevice::open(bus.clone(), slot, model, id.clone(), None) {
                 Ok(dev) => {
                     log::info!("opened {} ({id}) via {} slot {slot} (Bragi, experimental)", model.name, rx.name);
@@ -801,23 +800,6 @@ pub(super) fn discover(
             }
         }
     }
-}
-
-fn slug_cache() -> &'static std::sync::Mutex<Vec<(CString, &'static str)>> {
-    static C: std::sync::OnceLock<std::sync::Mutex<Vec<(CString, &'static str)>>> = std::sync::OnceLock::new();
-    C.get_or_init(Default::default)
-}
-
-/// Model slug of the device last seen at a receiver slot path.
-fn known_slug(path: &CStr) -> Option<&'static str> {
-    let c = slug_cache().lock().unwrap_or_else(|e| e.into_inner());
-    c.iter().find(|(p, _)| p.as_c_str() == path).map(|(_, s)| *s)
-}
-
-fn remember_slug(path: &CStr, slug: &'static str) {
-    let mut c = slug_cache().lock().unwrap_or_else(|e| e.into_inner());
-    c.retain(|(p, _)| p.as_c_str() != path);
-    c.push((path.to_owned(), slug));
 }
 
 /// PID of the device in `slot`; a device that is just waking up answers 0

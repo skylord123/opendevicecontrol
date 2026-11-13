@@ -355,7 +355,7 @@ fn manager(h: Handle, rx: Receiver<Command>) {
         }
 
         if Instant::now() >= next_scan {
-            let held: Vec<CString> = workers.iter().map(|w| w.path.clone()).collect();
+            let held: Vec<(CString, String)> = workers.iter().map(|w| (w.path.clone(), w.id.clone())).collect();
             match opendevicecontrol_core::discover(&held) {
                 Ok(found) => {
                     for (path, dev) in found {
@@ -436,14 +436,39 @@ pub fn keymap_backup_path(device: &str, what: &str) -> std::path::PathBuf {
 
 /// Save `value` as the backup `what` of `device`, unless one exists.
 fn backup_once<T: serde::Serialize>(device: &str, what: &str, value: &T) -> std::io::Result<()> {
-    let path = keymap_backup_path(device, what);
-    if path.exists() {
-        return Ok(());
+    write_backup_once(&keymap_backup_path(device, what), value)
+}
+
+/// Write `value` to `path` unless a readable backup is already there. The
+/// file is written to a temporary name and renamed into place, so an
+/// interrupted save never leaves a partial file that later counts as the
+/// original; a file that isn't valid JSON (from an older, interrupted
+/// save) is replaced.
+fn write_backup_once<T: serde::Serialize>(path: &std::path::Path, value: &T) -> std::io::Result<()> {
+    if let Ok(bytes) = std::fs::read(path) {
+        if serde_json::from_slice::<serde_json::Value>(&bytes).is_ok() {
+            return Ok(());
+        }
+        log::warn!("{}: unreadable keymap backup, replacing it", path.display());
     }
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(&path, serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?)
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".{}.tmp", std::process::id()));
+    let tmp = std::path::PathBuf::from(tmp);
+    let res = (|| {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
 }
 
 fn keymap_command(h: &Handle, id: &str, dev: &mut dyn Device, cmd: KeymapCmd) {
@@ -523,7 +548,17 @@ fn keymap_command(h: &Handle, id: &str, dev: &mut dyn Device, cmd: KeymapCmd) {
                     }
                     status(h, Some("Macros saved to the keyboard.".into()));
                 }
-                Err(e) => status(h, Some(format!("Saving macros failed: {e}"))),
+                Err(e) => {
+                    // A failure part-way can leave some pages written; show
+                    // what the keyboard holds now.
+                    if let Ok(now) = dev.read_macros() {
+                        if let Some(v) = h.shared.write().devices.get_mut(id) {
+                            v.macros = Some(now);
+                        }
+                    }
+                    let backup = keymap_backup_path(id, "macros");
+                    status(h, Some(format!("Saving macros failed: {e}. The original macros are backed up in {}.", backup.display())));
+                }
             }
         }
     }
@@ -1205,5 +1240,33 @@ mod tests {
         }
         assert!(fail(&h, "psu", &mut ws.poll_failures, POLL_FAIL_LIMIT, "poll"));
         assert!(fail(&h, "psu", &mut ws.light_failures, LIGHT_FAIL_LIMIT, "frame"));
+    }
+}
+
+#[cfg(test)]
+mod backup_tests {
+    use super::write_backup_once;
+
+    #[test]
+    fn backup_is_kept_once_and_replaced_when_corrupt() {
+        let dir = std::env::temp_dir().join(format!("odc-backup-test-{}", std::process::id()));
+        let path = dir.join("kb-macros.json");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        write_backup_once(&path, &vec![1, 2, 3]).unwrap();
+        // A second save keeps the original.
+        write_backup_once(&path, &vec![9]).unwrap();
+        let v: Vec<i32> = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(v, vec![1, 2, 3]);
+
+        // A truncated file from an interrupted older save is not a backup.
+        std::fs::write(&path, b"[1, 2").unwrap();
+        write_backup_once(&path, &vec![4]).unwrap();
+        let v: Vec<i32> = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(v, vec![4]);
+
+        // No temporary files left behind.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

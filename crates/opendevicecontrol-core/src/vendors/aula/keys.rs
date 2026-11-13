@@ -280,6 +280,24 @@ pub fn macros_from_area(area: &[u8]) -> Vec<Macro> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readback_compare_uses_the_stored_form() {
+        let m = Macro {
+            name: "a very long macro name".into(),
+            steps: vec![MacroStep { action: MacroAction::KeyDown(4), delay_ms: 10 }],
+        };
+        let area = macro_area(std::slice::from_ref(&m)).unwrap();
+        let written = macros_from_area(&area);
+        // The keyboard holds the trimmed name, so the readback is compared
+        // with the stored form, not the request.
+        assert_eq!(written[0].name.len(), MACRO_NAME_MAX);
+        assert_ne!(written[0], m);
+        // A page that never reached flash (still blank) reads differently.
+        let mut stale = area.clone();
+        stale[DIRECTORY * 4..].fill(0);
+        assert_ne!(macros_from_area(&stale), written);
+    }
     use crate::keymap::modifier;
 
     #[test]

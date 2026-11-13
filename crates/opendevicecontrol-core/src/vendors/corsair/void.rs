@@ -544,10 +544,10 @@ pub(crate) fn discover(
 ) {
     for d in list.iter().filter(|d| model_for_pid(d.product_id()).is_some() && is_main(d)) {
         let model = model_for_pid(d.product_id()).unwrap();
-        let id = ids.next(model.slug);
         if skip_paths.iter().any(|p| p.as_c_str() == d.path()) {
             continue;
         }
+        let id = ids.next(model.slug);
         let sidetone = list
             .iter()
             .find(|s| s.product_id() == d.product_id() && s.serial_number() == d.serial_number() && is_sidetone(s))

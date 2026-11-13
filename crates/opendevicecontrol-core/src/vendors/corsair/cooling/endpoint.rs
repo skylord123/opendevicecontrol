@@ -172,6 +172,28 @@ pub fn parse_led_ports(r: &[u8]) -> Vec<Option<u16>> {
         .collect()
 }
 
+/// How one input report relates to the command just sent.
+#[derive(Debug, PartialEq)]
+enum Reply {
+    /// The answer: `[echo, status, payload...]` (prefix stripped).
+    Match(Vec<u8>),
+    /// An answer to some other command (stale or foreign); keep reading.
+    Foreign,
+    /// Echoes the command but stops before its status byte.
+    Truncated,
+}
+
+fn match_reply(prefix_len: usize, cmd: &[u8], raw: &[u8]) -> Reply {
+    let r = raw.get(prefix_len..).unwrap_or(&[]);
+    if r.is_empty() || r.first() != cmd.first() {
+        return Reply::Foreign;
+    }
+    if r.len() < 2 {
+        return Reply::Truncated;
+    }
+    Reply::Match(r.to_vec())
+}
+
 pub struct EndpointIo {
     dev: HidDevice,
     prefix: Vec<u8>,
@@ -210,7 +232,7 @@ impl EndpointIo {
         self.drain();
         self.dev.write(&encode(prefix, cmd, data, self.packet))?;
         let deadline = Instant::now() + self.timeout;
-        let mut last = None;
+        let no_reply = Error::NoReply { cmd: cmd.first().copied().unwrap_or(0) };
         for _ in 0..4 {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -222,14 +244,17 @@ impl EndpointIo {
                 break;
             }
             buf.truncate(n);
-            let r = buf.get(prefix.len()..).unwrap_or(&[]).to_vec();
-            if r.first() == cmd.first() {
-                return Ok(r);
+            match match_reply(prefix.len(), cmd, &buf) {
+                Reply::Match(r) => return Ok(r),
+                Reply::Truncated => {
+                    log::debug!("endpoint: truncated reply {:02x?}", &buf[..buf.len().min(6)]);
+                    return Err(no_reply);
+                }
+                Reply::Foreign => log::trace!("endpoint: unexpected reply {:02x?}", &buf[..buf.len().min(6)]),
             }
-            log::trace!("endpoint: unexpected reply {:02x?}", &buf[..buf.len().min(6)]);
-            last = Some(r);
         }
-        last.ok_or(Error::NoReply { cmd: cmd.first().copied().unwrap_or(0) })
+        // Only replies to other commands (or none): this one wasn't answered.
+        Err(no_reply)
     }
 
     /// Read an endpoint. When `multi` names the expected data type and the
@@ -291,11 +316,13 @@ impl EndpointIo {
     /// Set duties (percent) per channel.
     pub fn set_speeds(&self, duties: &[(u8, u8)]) -> Result<()> {
         let payload = write_payload(Some(dtype::SET_SPEED), &speed_data(duties), true);
+        // `transfer` only returns replies that echo the command and carry
+        // a status byte, so `r[1]` is the status.
         let r = self.write_endpoint(ep::SET_SPEED, &payload)?;
-        if r.get(1).is_some_and(|&s| s != 0) {
+        if r[1] != 0 {
             // The LINK hub occasionally rejects a speed write; retry once.
             let r = self.write_endpoint(ep::SET_SPEED, &payload)?;
-            if r.get(1).is_some_and(|&s| s != 0) {
+            if r[1] != 0 {
                 return Err(Error::Unsupported { cmd: ep::SET_SPEED });
             }
         }
@@ -359,5 +386,19 @@ mod tests {
 
         let leds = [0x08, 0, 0x0f, 0, 2, 2, 0, 29, 0, 3, 0, 0, 0];
         assert_eq!(parse_led_ports(&leds), vec![Some(29), None]);
+    }
+
+    #[test]
+    fn replies_must_echo_the_command_and_carry_a_status() {
+        // LINK hub prefix is two bytes; the echo follows it.
+        assert_eq!(match_reply(2, WRITE, &[0x00, 0x01, 0x06, 0x00, 0xaa]), Reply::Match(vec![0x06, 0x00, 0xaa]));
+        // A reply to another command (e.g. a stale CLOSE) is not ours.
+        assert_eq!(match_reply(2, WRITE, &[0x00, 0x01, 0x05, 0x00]), Reply::Foreign);
+        // Nothing after the prefix.
+        assert_eq!(match_reply(2, WRITE, &[0x00, 0x01]), Reply::Foreign);
+        // Echo without a status byte.
+        assert_eq!(match_reply(1, WRITE, &[0x08, 0x06]), Reply::Truncated);
+        // Commander family: one-byte prefix.
+        assert_eq!(match_reply(1, GET_FIRMWARE, &[0x08, 0x02, 0x00, 2, 4]), Reply::Match(vec![0x02, 0x00, 2, 4]));
     }
 }

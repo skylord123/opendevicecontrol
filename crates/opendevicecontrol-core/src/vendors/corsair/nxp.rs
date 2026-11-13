@@ -198,12 +198,13 @@ pub fn is_command_interface(m: &NxpModel, d: &hidapi::DeviceInfo) -> bool {
     (m.command_interface < 0 || d.interface_number() == m.command_interface) && d.usage_page() == 0xffc2
 }
 
-/// Whether `i` is an input collection belonging to command collection `cmd`.
-pub fn is_input_interface(m: &NxpModel, cmd: &hidapi::DeviceInfo, i: &hidapi::DeviceInfo) -> bool {
+/// Whether `i` is an input collection belonging to command collection `cmd`,
+/// with `units` units of this model plugged in (see [`super::same_unit`]).
+pub fn is_input_interface(m: &NxpModel, cmd: &hidapi::DeviceInfo, i: &hidapi::DeviceInfo, units: usize) -> bool {
     m.input_interface.is_some_and(|n| i.interface_number() == n)
         && i.product_id() == cmd.product_id()
         && i.usage_page() >= 0xff00
-        && i.serial_number() == cmd.serial_number()
+        && super::same_unit(super::serial_of(i), super::serial_of(cmd), units)
         && i.path() != cmd.path()
 }
 
@@ -655,12 +656,12 @@ impl NxpDevice {
 
     fn step_dpi(&mut self, up: bool) {
         let n = DPI_STAGES as u8;
-        self.dpi_stage = match (up, self.model.dpi_cycle) {
+        let stage = match (up, self.model.dpi_cycle) {
             (true, true) => self.dpi_stage % n + 1,
             (true, false) => (self.dpi_stage + 1).min(n),
             (false, _) => self.dpi_stage.saturating_sub(1).max(1),
         };
-        if let Err(e) = self.select_dpi_stage() {
+        if let Err(e) = set_if_applied(self, |d| &mut d.dpi_stage, stage, |d| d.select_dpi_stage()) {
             log::warn!("{}: DPI: {e}", self.info.id);
         }
     }
@@ -724,6 +725,19 @@ impl NxpDevice {
             }
         }
     }
+}
+
+/// Set the cached `field` of `d` to `v` and run `apply`, which sends the
+/// cached state to the device; if that fails, the old value is put back so
+/// the cache (and what is reported and saved from it) stays what the device
+/// confirmed.
+fn set_if_applied<S, T>(d: &mut S, field: fn(&mut S) -> &mut T, v: T, apply: impl FnOnce(&S) -> Result<()>) -> Result<()> {
+    let old = std::mem::replace(field(d), v);
+    let r = apply(d);
+    if r.is_err() {
+        *field(d) = old;
+    }
+    r
 }
 
 impl Device for NxpDevice {
@@ -792,29 +806,37 @@ impl Device for NxpDevice {
             (CTRL_WIN_LOCK | CTRL_LOCK_ALT_TAB | CTRL_LOCK_ALT_F4 | CTRL_LOCK_SHIFT_TAB, ControlValue::Bool(v))
                 if self.model.win_lock != WinLock::None =>
             {
-                match id {
-                    CTRL_WIN_LOCK => self.win_lock = *v,
-                    CTRL_LOCK_ALT_TAB => self.lock_alt_tab = *v,
-                    CTRL_LOCK_ALT_F4 => self.lock_alt_f4 = *v,
-                    _ => self.lock_shift_tab = *v,
+                let field: fn(&mut Self) -> &mut bool = match id {
+                    CTRL_WIN_LOCK => |d| &mut d.win_lock,
+                    CTRL_LOCK_ALT_TAB => |d| &mut d.lock_alt_tab,
+                    CTRL_LOCK_ALT_F4 => |d| &mut d.lock_alt_f4,
+                    _ => |d| &mut d.lock_shift_tab,
+                };
+                let r = set_if_applied(self, field, *v, |d| d.apply_key_locks());
+                if r.is_err() {
+                    // The lock flags are two writes: put back what we
+                    // still believe is set (best effort).
+                    let _ = self.apply_key_locks();
                 }
-                self.apply_key_locks()
+                r
             }
+            // The cached value changes only once the device took it.
             (CTRL_SIDE_LIGHTS, ControlValue::Bool(v)) if self.model.side_lights => {
+                self.write(&[0x07, 0x05, 0x08, 0x00, *v as u8])?;
                 self.side_lights = *v;
-                self.write(&[0x07, 0x05, 0x08, 0x00, *v as u8])
+                Ok(())
             }
             (CTRL_ANGLE_SNAP, ControlValue::Bool(v)) if self.model.max_dpi > 0 => {
+                self.write(&[0x07, 0x13, 0x04, 0x00, *v as u8, 0x05])?;
                 self.angle_snap = *v;
-                self.write(&[0x07, 0x13, 0x04, 0x00, *v as u8, 0x05])
+                Ok(())
             }
             (CTRL_DPI_STAGE, ControlValue::Choice(s)) if self.model.max_dpi > 0 => {
                 let s: u8 = s.parse().map_err(|_| invalid())?;
                 if !(1..=DPI_STAGES as u8).contains(&s) {
                     return Err(invalid());
                 }
-                self.dpi_stage = s;
-                self.select_dpi_stage()
+                set_if_applied(self, |d| &mut d.dpi_stage, s, |d| d.select_dpi_stage())
             }
             (_, ControlValue::Number(v)) if self.model.max_dpi > 0 => {
                 let stage = if id == CTRL_SNIPER_DPI {
@@ -823,13 +845,15 @@ impl Device for NxpDevice {
                     (1..=DPI_STAGES).find(|s| dpi_ctrl(*s) == id).ok_or_else(|| Error::UnknownControl(id.into()))?
                 };
                 let dpi = ((v / 50.0).round() * 50.0).clamp(100.0, self.model.max_dpi as f64) as u16;
+                self.write(&dpi_stage_packet(stage as u8, dpi, self.dpi_color(stage)))?;
                 self.dpi[stage] = dpi;
-                self.write(&dpi_stage_packet(stage as u8, dpi, self.dpi_color(stage)))
+                Ok(())
             }
             (CTRL_POLL_RATE, ControlValue::Choice(c)) if self.model.poll_rate => {
                 let (ms, _) = POLL_RATES.iter().find(|(_, n)| n == c).ok_or_else(invalid)?;
+                self.write(&[0x07, 0x0a, 0x00, 0x00, *ms])?;
                 self.poll_ms = Some(*ms);
-                self.write(&[0x07, 0x0a, 0x00, 0x00, *ms])
+                Ok(())
             }
             // A known control with a value of the wrong type.
             (
@@ -895,8 +919,8 @@ impl Device for NxpDevice {
                     // Built-in functions work like they do under iCUE.
                     match (k.id, down) {
                         (KEY_WINLOCK, true) => {
-                            self.win_lock = !self.win_lock;
-                            if let Err(e) = self.apply_key_locks() {
+                            let v = !self.win_lock;
+                            if let Err(e) = set_if_applied(self, |d| &mut d.win_lock, v, |d| d.apply_key_locks()) {
                                 log::warn!("win lock: {e}");
                             }
                         }
