@@ -3,12 +3,55 @@
 //! working while the main window is hidden.
 
 use crate::service::Handle;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 pub type ShowFn = Arc<dyn Fn() + Send + Sync>;
+
+/// Whether the tray icon came up: the window must stay reachable without it.
+struct Readiness(AtomicU8);
+
+const PENDING: u8 = 0;
+const READY: u8 = 1;
+const FAILED: u8 = 2;
+
+impl Readiness {
+    const fn new() -> Self {
+        Self(AtomicU8::new(PENDING))
+    }
+
+    fn set(&self, ok: bool) {
+        self.0.store(if ok { READY } else { FAILED }, Ordering::SeqCst);
+    }
+
+    fn is_ready(&self) -> bool {
+        self.0.load(Ordering::SeqCst) == READY
+    }
+
+    /// Wait up to `timeout` for the outcome; true when the icon is up.
+    fn wait(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while self.0.load(Ordering::SeqCst) == PENDING && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        self.is_ready()
+    }
+}
+
+static READINESS: Readiness = Readiness::new();
+
+/// True once the tray icon is up (false while starting or after it failed).
+pub fn is_ready() -> bool {
+    READINESS.is_ready()
+}
+
+/// Wait for the tray icon to come up or fail; true when it is up.
+pub fn wait_ready(timeout: Duration) -> bool {
+    READINESS.wait(timeout)
+}
 
 struct Tray {
     tray: TrayIcon,
@@ -58,8 +101,7 @@ fn tick(t: &mut Tray, h: &Handle, show: &ShowFn) {
         if ev.id == t.show_id {
             show();
         } else if ev.id == t.quit_id {
-            h.shutdown();
-            std::process::exit(0);
+            std::process::exit(if h.shutdown().is_ok() { 0 } else { 1 });
         }
     }
     while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
@@ -85,8 +127,12 @@ pub fn spawn(h: Handle, show: ShowFn) {
             use windows_sys::Win32::UI::WindowsAndMessaging::{DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE};
             let mut t = match build() {
                 Ok(t) => t,
-                Err(e) => return log::error!("tray icon unavailable: {e}"),
+                Err(e) => {
+                    READINESS.set(false);
+                    return log::error!("tray icon unavailable: {e}");
+                }
             };
+            READINESS.set(true);
             loop {
                 unsafe {
                     let mut msg: MSG = std::mem::zeroed();
@@ -108,12 +154,17 @@ pub fn spawn(h: Handle, show: ShowFn) {
         .name("opendevicecontrol-tray".into())
         .spawn(move || {
             if let Err(e) = gtk::init() {
+                READINESS.set(false);
                 return log::error!("tray icon unavailable (GTK init failed): {e}");
             }
             let t = match build() {
                 Ok(t) => t,
-                Err(e) => return log::error!("tray icon unavailable: {e}"),
+                Err(e) => {
+                    READINESS.set(false);
+                    return log::error!("tray icon unavailable: {e}");
+                }
             };
+            READINESS.set(true);
             let t = std::cell::RefCell::new(t);
             gtk::glib::timeout_add_local(Duration::from_millis(50), move || {
                 tick(&mut t.borrow_mut(), &h, &show);
@@ -122,4 +173,24 @@ pub fn spawn(h: Handle, show: ShowFn) {
             gtk::main();
         })
         .expect("spawn tray");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readiness_reports_failure_and_success() {
+        let r = Readiness::new();
+        assert!(!r.is_ready());
+        // Still starting: gives up after the timeout.
+        assert!(!r.wait(Duration::from_millis(30)));
+        r.set(false);
+        let t = Instant::now();
+        assert!(!r.wait(Duration::from_secs(5)));
+        assert!(t.elapsed() < Duration::from_secs(1));
+        r.set(true);
+        assert!(r.wait(Duration::from_secs(5)));
+        assert!(r.is_ready());
+    }
 }

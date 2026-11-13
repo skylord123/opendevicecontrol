@@ -409,12 +409,11 @@ impl Device for HxiPsu {
         Ok(())
     }
 
-    fn release(&mut self) {
+    fn release(&mut self) -> Result<()> {
         // Never leave the PSU fan pinned at a fixed duty without us running.
-        if let Err(e) = self.write(cmd::FAN_CONTROL_MODE, &[0]) {
-            log::warn!("could not restore hardware fan mode: {e}");
-        }
+        let r = self.write(cmd::FAN_CONTROL_MODE, &[0]);
         self.software_fan = false;
+        r
     }
 }
 

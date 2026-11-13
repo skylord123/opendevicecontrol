@@ -752,10 +752,11 @@ impl Device for AulaKeyboard {
         }
     }
 
-    fn release(&mut self) {
+    fn release(&mut self) -> Result<()> {
         // Nothing to send: without refreshes the keyboard returns to its own
         // effect by itself.
         self.frame.clear();
+        Ok(())
     }
 }
 

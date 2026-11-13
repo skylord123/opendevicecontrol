@@ -17,7 +17,7 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 /// How much history the GUI keeps for every sensor (in memory).
@@ -30,6 +30,10 @@ pub type Series = VecDeque<[f64; 2]>;
 const FRAME: Duration = Duration::from_millis(33);
 /// Key input polling interval for devices that report keys.
 const INPUT_TICK: Duration = Duration::from_millis(10);
+/// How long the manager waits for all workers to release their devices.
+const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long [`Handle::shutdown`] waits for the manager to finish.
+const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(4);
 
 #[derive(Debug, Clone)]
 pub struct DeviceView {
@@ -122,7 +126,8 @@ pub enum Command {
     /// Energy counter last published (possibly by the other OS); the local
     /// counter continues from whichever is larger.
     SeedEnergy { device: String, kwh: f64 },
-    Shutdown(Sender<()>),
+    /// Release every device; answers whether all of them were handed back.
+    Shutdown(Sender<Result<(), String>>),
 }
 
 /// A key press/release from a device.
@@ -147,6 +152,8 @@ pub struct Handle {
     pub quitting: Arc<AtomicBool>,
     /// Set by the MQTT thread once it has said goodbye (or is idle).
     pub mqtt_done: Arc<AtomicBool>,
+    /// Outcome of the one shutdown every caller waits for.
+    shutdown_result: Arc<OnceLock<Result<(), String>>>,
     /// What the computer is playing, for sound-reactive lighting.
     pub audio: crate::audio::Audio,
 }
@@ -193,11 +200,19 @@ impl Handle {
     }
 
     /// Stop everything: MQTT says goodbye, devices return to hardware
-    /// control, energy counters are saved. Blocks up to ~4 s. Idempotent.
-    pub fn shutdown(&self) {
-        if self.quitting.swap(true, Ordering::SeqCst) {
-            return;
-        }
+    /// control, energy counters are saved. Blocks up to ~5 s. Every caller,
+    /// including concurrent ones, waits for the same single run and gets its
+    /// outcome: `Err` when a device could not be handed back to hardware
+    /// control or the service did not stop in time.
+    pub fn shutdown(&self) -> Result<(), String> {
+        let r = self.shutdown_result.get_or_init(|| self.run_shutdown()).clone();
+        // Tell a waiting `opendevicecontrol --quit` before anyone exits.
+        crate::ipc::report_shutdown(&r);
+        r
+    }
+
+    fn run_shutdown(&self) -> Result<(), String> {
+        self.quitting.store(true, Ordering::SeqCst);
         log::info!("shutting down");
         self.notify();
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -205,9 +220,15 @@ impl Handle {
             std::thread::sleep(Duration::from_millis(20));
         }
         let (tx, rx) = crossbeam_channel::bounded(1);
-        if self.cmd.send(Command::Shutdown(tx)).is_ok() {
-            let _ = rx.recv_timeout(Duration::from_secs(4));
+        let r = match self.cmd.send(Command::Shutdown(tx)) {
+            Ok(()) => rx.recv_timeout(SERVICE_STOP_TIMEOUT).unwrap_or_else(|_| Err("the device service did not stop in time".into())),
+            Err(_) => Err("the device service is not running".into()),
+        };
+        if let Err(e) = &r {
+            log::error!("shutdown incomplete: {e}");
+            log::logger().flush();
         }
+        r
     }
 }
 
@@ -230,6 +251,7 @@ pub fn start(config: Arc<RwLock<Config>>) -> Handle {
         key_listeners: Arc::new(Mutex::new(Vec::new())),
         quitting: Arc::new(AtomicBool::new(false)),
         mqtt_done: Arc::new(AtomicBool::new(true)),
+        shutdown_result: Arc::new(OnceLock::new()),
         audio: crate::audio::Audio::default(),
     };
     let h = handle.clone();
@@ -247,7 +269,8 @@ enum WorkerCmd {
     PreviewKey(String),
     Keymap(KeymapCmd),
     ConfigChanged,
-    Stop(Sender<()>),
+    /// Release the device and exit; answers with the release outcome.
+    Stop(Sender<Result<(), String>>),
 }
 
 struct Worker {
@@ -273,23 +296,17 @@ fn manager(h: Handle, rx: Receiver<Command>) {
     loop {
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(Command::Shutdown(done)) => {
-                let mut acks = Vec::new();
-                for w in &workers {
-                    let (tx, rx) = crossbeam_channel::bounded(1);
-                    if w.tx.send(WorkerCmd::Stop(tx)).is_ok() {
-                        acks.push(rx);
-                    }
-                }
-                for a in acks {
-                    let _ = a.recv_timeout(Duration::from_secs(3));
-                }
+                let result = stop_workers(workers.iter().map(|w| (w.id.as_str(), &w.tx)), WORKER_STOP_TIMEOUT);
                 state.lock().save();
                 h.notify();
                 // Log before signalling: the caller may exit the process
                 // as soon as it receives `done`.
-                log::info!("service stopped (devices returned to hardware control)");
+                match &result {
+                    Ok(()) => log::info!("service stopped (devices returned to hardware control)"),
+                    Err(e) => log::error!("service stopped, but not every device was handed back: {e}"),
+                }
                 log::logger().flush();
-                let _ = done.send(());
+                let _ = done.send(result);
                 return;
             }
             Ok(Command::SetControl { device, id, value }) => {
@@ -390,6 +407,40 @@ fn manager(h: Handle, rx: Receiver<Command>) {
             next_save = Instant::now() + Duration::from_secs(60);
         }
     }
+}
+
+/// Ask workers to release their devices and wait (in parallel, up to
+/// `timeout` in total) for every answer. `Err` lists the devices that failed
+/// to release or did not answer in time.
+fn stop_workers<'a>(workers: impl Iterator<Item = (&'a str, &'a Sender<WorkerCmd>)>, timeout: Duration) -> Result<(), String> {
+    let mut acks = Vec::new();
+    for (id, tx) in workers {
+        let (atx, arx) = crossbeam_channel::bounded(1);
+        // A worker that already exited released its device itself.
+        if tx.send(WorkerCmd::Stop(atx)).is_ok() {
+            acks.push((id, arx));
+        }
+    }
+    let deadline = Instant::now() + timeout;
+    let mut failed = Vec::new();
+    for (id, rx) in acks {
+        match rx.recv_deadline(deadline) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => failed.push(format!("{id}: {e}")),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => failed.push(format!("{id}: did not stop in time")),
+            // Dropped the request without answering (panicked).
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => failed.push(format!("{id}: stopped without releasing")),
+        }
+    }
+    if failed.is_empty() { Ok(()) } else { Err(failed.join("; ")) }
+}
+
+/// Hand a device back to firmware control, logging a failure.
+fn release(id: &str, dev: &mut dyn Device) -> Result<(), String> {
+    dev.release().map_err(|e| {
+        log::error!("{id}: could not return to hardware control: {e}");
+        e.to_string()
+    })
 }
 
 // ----------------------------------------------------------------- worker
@@ -591,11 +642,11 @@ fn worker(h: Handle, state: Arc<Mutex<State>>, mut dev: Box<dyn Device>, rx: Rec
         }
         match rx.recv_timeout(due.saturating_duration_since(Instant::now())) {
             Ok(WorkerCmd::Stop(done)) => {
-                dev.release();
+                let r = release(&id, &mut *dev);
                 if let Some(v) = h.shared.write().devices.get_mut(&id) {
                     v.online = false;
                 }
-                let _ = done.send(());
+                let _ = done.send(r);
                 return;
             }
             Ok(WorkerCmd::SetControl(cid, value)) => {
@@ -636,7 +687,7 @@ fn worker(h: Handle, state: Arc<Mutex<State>>, mut dev: Box<dyn Device>, rx: Rec
                 continue;
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                dev.release();
+                let _ = release(&id, &mut *dev);
                 return;
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
@@ -693,7 +744,7 @@ fn worker(h: Handle, state: Arc<Mutex<State>>, mut dev: Box<dyn Device>, rx: Rec
                 }
                 Err(e) => {
                     if fail(&h, &id, &mut ws, &e.to_string()) {
-                        dev.release();
+                        let _ = release(&id, &mut *dev);
                         return;
                     }
                 }
@@ -767,7 +818,7 @@ fn worker(h: Handle, state: Arc<Mutex<State>>, mut dev: Box<dyn Device>, rx: Rec
                 }
                 Err(e) => {
                     if fail(&h, &id, &mut ws, &e.to_string()) {
-                        dev.release();
+                        let _ = release(&id, &mut *dev);
                         return;
                     }
                 }
@@ -970,21 +1021,11 @@ fn ram_config_changed(h: &Handle, workers: &mut Vec<Worker>, ram_scanned: &mut b
         return;
     }
     *ram_scanned = false;
-    let mut acks = Vec::new();
-    let mut ids = Vec::new();
-    workers.retain(|w| {
-        if !is_ram_worker(w) {
-            return true;
-        }
-        ids.push(w.id.clone());
-        let (tx, rx) = crossbeam_channel::bounded(1);
-        if w.tx.send(WorkerCmd::Stop(tx)).is_ok() {
-            acks.push(rx);
-        }
-        false
-    });
-    for a in acks {
-        let _ = a.recv_timeout(Duration::from_secs(3));
+    let (ram, rest): (Vec<Worker>, Vec<Worker>) = std::mem::take(workers).into_iter().partition(is_ram_worker);
+    *workers = rest;
+    let ids: Vec<String> = ram.iter().map(|w| w.id.clone()).collect();
+    if let Err(e) = stop_workers(ram.iter().map(|w| (w.id.as_str(), &w.tx)), WORKER_STOP_TIMEOUT) {
+        log::warn!("RAM lighting: {e}");
     }
     let changed = {
         let mut sh = h.shared.write();
@@ -995,5 +1036,143 @@ fn ram_config_changed(h: &Handle, workers: &mut Vec<Worker>, ram_scanned: &mut b
     };
     if changed {
         h.notify();
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use opendevicecontrol_core::{DeviceKind, Snapshot};
+
+    /// A worker thread that answers `Stop` with `answer` (never, if `None`).
+    fn fake_worker(answer: Option<Result<(), String>>) -> Sender<WorkerCmd> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        std::thread::spawn(move || {
+            if let Ok(WorkerCmd::Stop(done)) = rx.recv() {
+                match answer {
+                    Some(a) => {
+                        let _ = done.send(a);
+                    }
+                    // Stall: keep the request open past the deadline.
+                    None => std::thread::sleep(Duration::from_secs(2)),
+                }
+            }
+        });
+        tx
+    }
+
+    #[test]
+    fn stop_workers_reports_failures_and_stalls() {
+        let ok = fake_worker(Some(Ok(())));
+        let err = fake_worker(Some(Err("boom".into())));
+        let stalled = fake_worker(None);
+        let stalled2 = fake_worker(None);
+        // A worker that already exited: its receiver is gone.
+        let (exited, gone) = crossbeam_channel::unbounded::<WorkerCmd>();
+        drop(gone);
+        let t = Instant::now();
+        let workers = [("a", &ok), ("b", &err), ("c", &stalled), ("d", &stalled2), ("e", &exited)];
+        let e = stop_workers(workers.into_iter(), Duration::from_millis(300)).unwrap_err();
+        // One shared deadline, not one per worker.
+        assert!(t.elapsed() < Duration::from_millis(1000), "{:?}", t.elapsed());
+        assert!(e.contains("b: boom"), "{e}");
+        assert!(e.contains("c: did not stop in time"), "{e}");
+        assert!(e.contains("d: did not stop in time"), "{e}");
+        assert!(!e.contains("a:") && !e.contains("e:"), "{e}");
+
+        let ok = fake_worker(Some(Ok(())));
+        assert_eq!(stop_workers([("a", &ok)].into_iter(), Duration::from_secs(1)), Ok(()));
+    }
+
+    struct FailingRelease(DeviceInfo);
+
+    impl Device for FailingRelease {
+        fn info(&self) -> &DeviceInfo {
+            &self.0
+        }
+        fn poll(&mut self) -> opendevicecontrol_core::Result<Snapshot> {
+            Ok(Snapshot::default())
+        }
+        fn set_control(&mut self, id: &str, _: &ControlValue) -> opendevicecontrol_core::Result<()> {
+            Err(opendevicecontrol_core::Error::UnknownControl(id.into()))
+        }
+        fn release(&mut self) -> opendevicecontrol_core::Result<()> {
+            Err(opendevicecontrol_core::Error::NoReply { cmd: 0xf0 })
+        }
+    }
+
+    #[test]
+    fn release_errors_propagate() {
+        let mut dev = FailingRelease(DeviceInfo {
+            id: "fake".into(),
+            kind: DeviceKind::PowerSupply,
+            manufacturer: String::new(),
+            model: "Fake".into(),
+            vendor_string: None,
+            product_string: None,
+            usb_vid: 0,
+            usb_pid: 0,
+            serial: None,
+            firmware: None,
+        });
+        let e = release("fake", &mut dev).unwrap_err();
+        assert!(e.contains("did not answer"), "{e}");
+    }
+
+    /// A handle whose "manager" answers each shutdown with `answer` after a delay.
+    fn fake_handle(answer: Result<(), String>) -> (Handle, Arc<std::sync::atomic::AtomicUsize>) {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = count.clone();
+        std::thread::spawn(move || {
+            while let Ok(cmd) = rx.recv() {
+                if let Command::Shutdown(done) = cmd {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(200));
+                    let _ = done.send(answer.clone());
+                }
+            }
+        });
+        let h = Handle {
+            config: Arc::new(RwLock::new(Config::default())),
+            shared: Arc::new(RwLock::new(Shared {
+                started: Instant::now(),
+                devices: BTreeMap::new(),
+                conflicts: Vec::new(),
+                mqtt: MqttStatus::Disabled,
+                system_sensors: Vec::new(),
+                ram_status: None,
+                sensor_status: Vec::new(),
+            })),
+            cmd: tx,
+            listeners: Arc::new(Mutex::new(Vec::new())),
+            key_listeners: Arc::new(Mutex::new(Vec::new())),
+            quitting: Arc::new(AtomicBool::new(false)),
+            mqtt_done: Arc::new(AtomicBool::new(true)),
+            shutdown_result: Arc::new(OnceLock::new()),
+            audio: crate::audio::Audio::default(),
+        };
+        (h, count)
+    }
+
+    #[test]
+    fn concurrent_shutdowns_share_one_result() {
+        let (h, count) = fake_handle(Err("hxi: did not stop in time".into()));
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let h = h.clone();
+                std::thread::spawn(move || h.shutdown())
+            })
+            .collect();
+        for t in threads {
+            // Every caller waited for the run and sees its failure.
+            assert_eq!(t.join().unwrap(), Err("hxi: did not stop in time".into()));
+        }
+        assert_eq!(h.shutdown(), Err("hxi: did not stop in time".into()));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert!(h.quitting.load(Ordering::SeqCst));
+
+        let (h, _) = fake_handle(Ok(()));
+        assert_eq!(h.shutdown(), Ok(()));
     }
 }

@@ -135,7 +135,11 @@ pub fn run(h: Handle, start_hidden: bool, start_page: Option<String>) -> eframe:
     });
     let quitting = || h.quitting.load(std::sync::atomic::Ordering::Relaxed);
     let mut opened = false;
-    let mut wait = start_hidden;
+    // Without a tray icon a hidden window could not be opened again.
+    let mut wait = start_hidden && crate::tray::wait_ready(std::time::Duration::from_secs(3));
+    if start_hidden && !wait {
+        log::warn!("no tray icon; showing the window instead of starting minimized");
+    }
     loop {
         if wait {
             // In the tray: no window, no graphics context. Tray Quit and
@@ -276,12 +280,16 @@ impl eframe::App for FerroApp {
         // Close button -> to the tray (the window closes, OpenDeviceControl keeps
         // running), or quit.
         if ctx.input(|i| i.viewport().close_requested()) {
-            if self.h.config.read().general.close_to_tray && !self.h.quitting.load(std::sync::atomic::Ordering::Relaxed) {
+            // Only to a working tray icon: otherwise nothing could reopen it.
+            if self.h.config.read().general.close_to_tray
+                && crate::tray::is_ready()
+                && !self.h.quitting.load(std::sync::atomic::Ordering::Relaxed)
+            {
                 self.to_tray = true;
                 // From now on "show" opens a new window.
                 *window() = None;
             } else {
-                self.h.shutdown();
+                let _ = self.h.shutdown();
             }
         }
         ctx.request_repaint_after(std::time::Duration::from_secs(1));
@@ -382,7 +390,7 @@ impl eframe::App for FerroApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if !self.to_tray {
-            self.h.shutdown();
+            let _ = self.h.shutdown();
         }
     }
 }

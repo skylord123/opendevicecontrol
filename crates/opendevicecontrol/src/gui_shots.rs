@@ -223,5 +223,5 @@ fn render_screenshots() {
     let shared = h.shared.read().clone();
     let devices = crate::gui_sensors::device_order(shared.devices.values());
     std::fs::write(dir.join("report.txt"), crate::gui_sensors::report(&devices)).unwrap();
-    h.shutdown();
+    let _ = h.shutdown();
 }

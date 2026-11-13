@@ -916,20 +916,18 @@ impl Device for NxpDevice {
         events
     }
 
-    fn release(&mut self) {
+    fn release(&mut self) -> Result<()> {
         // Hardware mode (sent twice: some firmware ignores the first), then
         // give the special keys their built-in functions back (ckb-next:
         // otherwise the G-keys can freeze the keyboard).
-        let _ = self.write(&[0x07, 0x04, 0x01]);
+        let first = self.write(&[0x07, 0x04, 0x01]);
         pause(30);
-        let _ = self.write(&[0x07, 0x04, 0x01]);
+        let mode = self.write(&[0x07, 0x04, 0x01]).or(first);
         pause(30);
         if !self.is_keyboard() {
-            return;
+            return mode;
         }
-        if let Err(e) = self.write_key_table(&hardware_key_table(self.model)) {
-            log::warn!("{}: restoring hardware key table: {e}", self.info.id);
-        }
+        mode.and(self.write_key_table(&hardware_key_table(self.model)))
     }
 }
 

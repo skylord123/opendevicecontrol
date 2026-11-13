@@ -136,8 +136,11 @@ pub trait Device: Send {
     }
 
     /// Called before the device is dropped: return the device to a safe,
-    /// firmware-controlled state.
-    fn release(&mut self) {}
+    /// firmware-controlled state. Implementations attempt every step and
+    /// return the first error, so callers know the handoff is incomplete.
+    fn release(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Assigns stable ids: the model slug, suffixed `-2`, `-3`… for duplicates.

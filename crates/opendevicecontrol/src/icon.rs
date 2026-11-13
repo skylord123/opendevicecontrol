@@ -1,6 +1,19 @@
 //! Procedurally drawn application icon (no binary assets needed):
 //! a dark disc with a lightning bolt and a coloured ring.
 
+/// Sizes `--export-icon` accepts, in pixels.
+pub const EXPORT_SIZES: std::ops::RangeInclusive<u32> = 16..=1024;
+
+/// Parse the optional SIZE argument of `--export-icon` (default 256).
+pub fn parse_export_size(arg: Option<&str>) -> Result<u32, String> {
+    let Some(arg) = arg else { return Ok(256) };
+    let range = format!("{} to {}", EXPORT_SIZES.start(), EXPORT_SIZES.end());
+    match arg.parse::<u32>() {
+        Ok(n) if EXPORT_SIZES.contains(&n) => Ok(n),
+        _ => Err(format!("invalid icon size '{arg}': expected a number of pixels from {range}")),
+    }
+}
+
 pub fn rgba(size: u32) -> Vec<u8> {
     let s = size as f32;
     let mut out = vec![0u8; (size * size * 4) as usize];
@@ -47,23 +60,24 @@ pub fn rgba(size: u32) -> Vec<u8> {
     out
 }
 
-/// The icon as a PNG file.
-pub fn png(size: u32) -> Vec<u8> {
+/// The icon as a PNG file. `size` must be in [`EXPORT_SIZES`].
+pub fn png(size: u32) -> Result<Vec<u8>, png::EncodingError> {
     let mut out = Vec::new();
     {
         let mut enc = png::Encoder::new(&mut out, size, size);
         enc.set_color(png::ColorType::Rgba);
         enc.set_depth(png::BitDepth::Eight);
-        let mut w = enc.write_header().expect("png header");
-        w.write_image_data(&rgba(size)).expect("png data");
+        let mut w = enc.write_header()?;
+        w.write_image_data(&rgba(size))?;
     }
-    out
+    Ok(out)
 }
 
 /// The icon as a Windows .ico file (PNG-compressed entries, 16–256 px).
 pub fn ico() -> Vec<u8> {
     let sizes = [16u32, 24, 32, 48, 64, 128, 256];
-    let images: Vec<Vec<u8>> = sizes.iter().map(|&s| png(s)).collect();
+    // Fixed, valid sizes: encoding into memory cannot fail.
+    let images: Vec<Vec<u8>> = sizes.iter().map(|&s| png(s).expect("icon png")).collect();
     let mut out = vec![0, 0, 1, 0];
     out.extend_from_slice(&(sizes.len() as u16).to_le_bytes());
     let mut offset = 6 + 16 * sizes.len() as u32;
@@ -94,4 +108,25 @@ fn inside(poly: &[(f32, f32)], x: f32, y: f32) -> bool {
         j = i;
     }
     inside
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn export_size_is_validated() {
+        assert_eq!(parse_export_size(None), Ok(256));
+        assert_eq!(parse_export_size(Some("16")), Ok(16));
+        assert_eq!(parse_export_size(Some("1024")), Ok(1024));
+        for bad in ["0", "15", "1025", "4294967295", "-1", "abc", ""] {
+            assert!(parse_export_size(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn png_at_the_smallest_size() {
+        let data = png(*EXPORT_SIZES.start()).unwrap();
+        assert_eq!(&data[1..4], b"PNG");
+    }
 }

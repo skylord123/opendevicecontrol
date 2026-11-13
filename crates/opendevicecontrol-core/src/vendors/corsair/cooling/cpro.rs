@@ -302,10 +302,12 @@ impl Device for CommanderPro {
         Ok(())
     }
 
-    fn release(&mut self) {
+    fn release(&mut self) -> Result<()> {
+        let mut result = Ok(());
         for f in self.fans.clone() {
             if let Err(e) = self.hardware_fan(f) {
                 log::warn!("{}: fan {}: could not restore a firmware curve: {e}", self.model.name, f + 1);
+                result = result.and(Err(e));
             }
         }
         let mut any = false;
@@ -320,6 +322,7 @@ impl Device for CommanderPro {
         if any {
             let _ = self.send(cmd::COMMIT, &[0xff]);
         }
+        result
     }
 }
 
