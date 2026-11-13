@@ -127,6 +127,13 @@ pub trait Device: Send {
         None
     }
 
+    /// The least time between `set_lights` frames the device keeps up
+    /// with; `None` takes frames as fast as they are rendered. Animated
+    /// lighting is rendered at this pace, just before each frame is sent.
+    fn frame_interval(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     /// False while a wireless device is out of reach (e.g. a headset that is
     /// switched off while its receiver stays plugged in). The device stays
     /// open and keeps being polled; front-ends show it as offline instead of

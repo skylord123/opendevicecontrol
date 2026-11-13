@@ -89,8 +89,13 @@ struct Inner {
 struct State {
     frame: AudioFrame,
     beat_times: VecDeque<(Instant, f32)>,
+    /// Recent analyses (newest first), for [`Audio::frame_peak`].
+    recent: VecDeque<(Instant, [f32; BANDS], f32)>,
     last_read: Option<Instant>,
 }
+
+/// How much analysis history [`Audio::frame_peak`] can look back over.
+const RECENT: Duration = Duration::from_secs(1);
 
 impl Audio {
     /// The latest analysis; starts capturing if it isn't running.
@@ -112,6 +117,15 @@ impl Audio {
         f
     }
 
+    /// Like [`Audio::frame`], with bands and level at their peak over the
+    /// last `window`. For devices that take a frame only every so often:
+    /// a peak between two frames still shows in the next one.
+    pub fn frame_peak(&self, window: Duration) -> AudioFrame {
+        let mut f = self.frame();
+        apply_peak(&mut f, &self.0.state.lock().recent, window, Instant::now());
+        f
+    }
+
     fn idle(&self) -> bool {
         self.0.state.lock().last_read.is_none_or(|t| t.elapsed() > IDLE_STOP)
     }
@@ -124,6 +138,11 @@ impl Audio {
                 if let Some((frame, beat)) = an.push(samples, rate) {
                     let mut s = self.0.state.lock();
                     let count = s.frame.beat_count + beat.is_some() as u64;
+                    let now = Instant::now();
+                    s.recent.push_front((now, frame.bands, frame.level));
+                    while s.recent.back().is_some_and(|(t, ..)| now.duration_since(*t) > RECENT) {
+                        s.recent.pop_back();
+                    }
                     s.frame = AudioFrame { beat_count: count, error: None, ..frame };
                     if let Some(strength) = beat {
                         s.beat_times.push_front((Instant::now(), strength));
@@ -149,6 +168,17 @@ impl Audio {
         self.0.state.lock().frame = AudioFrame::default();
         self.0.running.store(false, Ordering::SeqCst);
         log::info!("sound-reactive lighting: capture stopped");
+    }
+}
+
+/// Raise `f`'s bands and level to their peak over the analyses in `recent`
+/// (newest first) from the last `window` before `now`.
+fn apply_peak(f: &mut AudioFrame, recent: &VecDeque<(Instant, [f32; BANDS], f32)>, window: Duration, now: Instant) {
+    for (_, bands, level) in recent.iter().take_while(|(t, ..)| now.saturating_duration_since(*t) <= window) {
+        for (a, b) in f.bands.iter_mut().zip(bands) {
+            *a = a.max(*b);
+        }
+        f.level = f.level.max(*level);
     }
 }
 
@@ -437,6 +467,22 @@ mod capture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peak_holds_what_happened_between_frames() {
+        let now = Instant::now();
+        let at = |ms: u64| now.checked_sub(Duration::from_millis(ms)).unwrap_or(now);
+        let mut loud = [0.0; BANDS];
+        loud[0] = 0.9;
+        let recent: VecDeque<_> =
+            [(at(5), [0.1; BANDS], 0.1), (at(60), loud, 0.8), (at(300), [1.0; BANDS], 1.0)].into_iter().collect();
+        let mut f = AudioFrame { bands: [0.1; BANDS], level: 0.1, ..AudioFrame::default() };
+        apply_peak(&mut f, &recent, Duration::from_millis(100), now);
+        // The beat 60 ms ago shows; the one 300 ms ago is outside the window.
+        assert_eq!(f.bands[0], 0.9);
+        assert_eq!(f.bands[1], 0.1);
+        assert_eq!(f.level, 0.8);
+    }
 
     fn sine(hz: f32, amp: f32, n: usize) -> Vec<f32> {
         (0..n).map(|i| amp * (std::f32::consts::TAU * hz * i as f32 / 48000.0).sin()).collect()

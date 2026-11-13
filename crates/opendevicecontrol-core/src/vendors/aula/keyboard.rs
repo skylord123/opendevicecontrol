@@ -537,6 +537,10 @@ impl Device for AulaKeyboard {
         Ok(Snapshot { sensors, controls: self.controls() })
     }
 
+    fn frame_interval(&self) -> Option<Duration> {
+        self.wired.then_some(super::wired::FRAME_GAP)
+    }
+
     fn poll_interval(&self) -> Option<Duration> {
         Some(if self.software { REFRESH / 2 } else { Duration::from_secs(1) })
     }

@@ -12,6 +12,10 @@ pub struct Wired {
     /// The collection carrying input report 3 (host keys, "settings
     /// changed"); on Linux the same interface node as `dev`.
     events: Option<hidapi::HidDevice>,
+    /// Linux: the keyboard interface (0), whose key reports hidraw also
+    /// gets, so typing is seen (see [`TYPING_HOLD`]). Windows keeps
+    /// keyboards to itself; [`crate::typing`] uses Raw Input there.
+    keys: Option<hidapi::HidDevice>,
     battery: Option<(u8, u8)>,
     next_battery_check: Instant,
     settings_changed: bool,
@@ -25,11 +29,20 @@ const BATTERY_CHECK: Duration = Duration::from_secs(30);
 /// While lighting frames stream, the battery read (which waits behind a
 /// 67 ms frame and stalls the next one) is put off, up to this long.
 const BATTERY_DEFER: Duration = Duration::from_secs(300);
-/// Least time between lighting frames. The keyboard takes 67 ms to accept
-/// a frame but longer to apply it, and queues what it hasn't applied yet:
-/// frames sent back to back pile up into seconds of lag and delay key
-/// presses. The official driver starts one about every 95 ms.
-const FRAME_GAP: Duration = Duration::from_millis(100);
+/// Least time between lighting frames. The keyboard's control endpoint
+/// takes 8-byte packets, and its firmware receives all 65 of a 520-byte
+/// report inside its USB interrupt, busy-waiting about 67 ms with key
+/// handling stalled (V14 firmware, 0xADD5). Frames back to back left it
+/// little time for keys; the official driver starts one about every 95 ms.
+pub const FRAME_GAP: Duration = Duration::from_millis(100);
+/// The service renders frames at [`FRAME_GAP`]; allow for timer jitter.
+const FRAME_SLACK: Duration = Duration::from_millis(15);
+/// While keys were pressed this recently, hold lighting frames back: each
+/// one stalls the keyboard's key handling for about 67 ms.
+const TYPING_HOLD: Duration = Duration::from_millis(400);
+/// But send one at least this often, or the keyboard leaves live mode
+/// (about 2 s without a frame) and flashes its built-in effect.
+const TYPING_KEEPALIVE: Duration = Duration::from_millis(1500);
 
 /// Send a read request and fetch its answer.
 fn read(dev: &hidapi::HidDevice, request: &[u8]) -> Result<Vec<u8>> {
@@ -43,20 +56,33 @@ fn read(dev: &hidapi::HidDevice, request: &[u8]) -> Result<Vec<u8>> {
 }
 
 impl Wired {
-    pub fn new(dev: hidapi::HidDevice, events: Option<hidapi::HidDevice>) -> Self {
-        if let Some(e) = &events {
-            let _ = e.set_blocking_mode(false);
+    pub fn new(dev: hidapi::HidDevice, events: Option<hidapi::HidDevice>, keys: Option<hidapi::HidDevice>) -> Self {
+        for h in events.iter().chain(&keys) {
+            let _ = h.set_blocking_mode(false);
         }
-        Self { dev, events, battery: None, next_battery_check: Instant::now(), settings_changed: false, host: Vec::new(), last_show: None }
+        Self { dev, events, keys, battery: None, next_battery_check: Instant::now(), settings_changed: false, host: Vec::new(), last_show: None }
     }
 
     /// Read input report 3 (`03 type a b`): host keys and change notices.
     fn read_events(&mut self) {
-        let Some(e) = &self.events else { return };
         let mut buf = [0u8; 64];
+        if let Some(k) = &self.keys {
+            while let Ok(n) = k.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                crate::typing::note_key();
+            }
+        }
+        let Some(e) = &self.events else { return };
         while let Ok(n) = e.read(&mut buf) {
             if n == 0 {
                 break;
+            }
+            // Linux: interface 1's node also carries its keyboard (4),
+            // system (1) and consumer (2) reports.
+            if cfg!(target_os = "linux") && n > 1 && buf[0] != 3 {
+                crate::typing::note_key();
             }
             if n >= 4 && buf[0] == 3 {
                 match buf[1] {
@@ -159,7 +185,12 @@ impl Link for Wired {
     }
 
     fn show(&mut self, leds: &[(u8, Rgb)], _uniform: Option<Rgb>) -> Result<bool> {
-        if self.last_show.is_some_and(|t| t.elapsed() < FRAME_GAP) {
+        self.read_events(); // Linux: notice typing first
+        let typing = crate::typing::since_last_key().is_some_and(|d| d < TYPING_HOLD);
+        if typing && self.last_show.is_some_and(|t| t.elapsed() < TYPING_KEEPALIVE) {
+            return Ok(false);
+        }
+        if self.last_show.is_some_and(|t| t.elapsed() + FRAME_SLACK < FRAME_GAP) {
             return Ok(false);
         }
         self.last_show = Some(Instant::now());

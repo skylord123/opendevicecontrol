@@ -148,9 +148,11 @@ output device (WASAPI loopback on Windows, the PulseAudio/PipeWire monitor on
 Linux), records nothing, and only captures while a sound effect is shown.
 
 On the Aula F99's USB cable, live lighting runs at about 10 frames a second,
-the same rate as the official driver. The keyboard takes 67 ms to accept
-each frame and a little longer to show it, and it queues frames it hasn't
-shown yet, so sending faster builds up lag and delays key presses.
+the same rate as the official driver. The keyboard's firmware spends about
+67 ms receiving each frame, and it can't handle keys during that time. So
+OpenDeviceControl pauses lighting frames while you type and picks them up
+again right after; sound effects show the music's peak since the last frame,
+so beats aren't lost. Over 2.4 GHz none of this applies.
 
 ## Corsair RGB memory (experimental, off by default)
 

@@ -101,7 +101,13 @@ fn open_link(api: &hidapi::HidApi, all: &[&hidapi::DeviceInfo], d: &hidapi::Devi
             .filter(|e| !cfg!(windows) || e.usage_page() == 0xff00)
             .filter_map(|e| api.open_path(e.path()).ok())
             .find(|h| declares_report(h, 0x03) && !declares_report(h, proto::wired::REPORT_ID) || !cfg!(windows));
-        (m, Box::new(wired::Wired::new(dev, events)))
+        // Linux: the keyboard interface (0), to notice typing. Windows
+        // doesn't let programs read keyboards.
+        let keys = all
+            .iter()
+            .filter(|e| cfg!(target_os = "linux") && e.vendor_id() == VID_WIRED && e.product_id() == PID_WIRED && e.interface_number() == 0)
+            .find_map(|e| api.open_path(e.path()).ok());
+        (m, Box::new(wired::Wired::new(dev, events, keys)))
     } else {
         let m = receiver::Receiver::query_model(&dev);
         if m.is_none() {

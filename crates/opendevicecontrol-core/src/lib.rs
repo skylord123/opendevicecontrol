@@ -11,6 +11,7 @@ pub mod model;
 pub mod smbus;
 pub mod system;
 pub mod transport;
+pub mod typing;
 pub mod vendors;
 
 pub use devices::{discover, Device};

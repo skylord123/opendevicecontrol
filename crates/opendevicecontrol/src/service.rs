@@ -833,8 +833,14 @@ fn worker(h: Handle, state: Arc<Mutex<State>>, mut dev: Box<dyn Device>, rx: Rec
             // A device running its own lighting only gets previewed.
             let preview = dev.preview_lights(t);
             let own = preview.is_some();
+            // A device that takes frames slower than we render them gets
+            // them at its own pace, each with the sound's peak since the last.
+            let pace = dev.frame_interval().filter(|&p| p > FRAME);
             let frame = preview.unwrap_or_else(|| {
-                let audio = (lighting.on && lighting.effect.is_sound()).then(|| h.audio.frame());
+                let audio = (lighting.on && lighting.effect.is_sound()).then(|| match pace {
+                    Some(p) => h.audio.frame_peak(p),
+                    None => h.audio.frame(),
+                });
                 crate::lighting::render(&lighting, &zones, &layout, t, audio.as_ref())
             });
             match if own { Ok(()) } else { dev.set_lights(&frame) } {
@@ -865,7 +871,14 @@ fn worker(h: Handle, state: Arc<Mutex<State>>, mut dev: Box<dyn Device>, rx: Rec
                     }
                 }
             }
-            next_frame = now + if own || crate::lighting::is_animated(&lighting) { FRAME } else { Duration::from_millis(500) };
+            next_frame = now
+                + if own {
+                    FRAME
+                } else if crate::lighting::is_animated(&lighting) {
+                    pace.unwrap_or(FRAME)
+                } else {
+                    Duration::from_millis(500)
+                };
         }
 
         // ---- sensors / controls ----
