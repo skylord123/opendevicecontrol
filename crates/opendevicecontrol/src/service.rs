@@ -14,7 +14,7 @@ use opendevicecontrol_core::{
     Limit, LightZone, Rgb, Sensor, SensorKind,
 };
 use parking_lot::{Mutex, RwLock};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -55,6 +55,9 @@ pub struct DeviceView {
     pub keys: Vec<InputKey>,
     /// Most recent key press, for the GUI.
     pub last_key: Option<(String, Instant)>,
+    /// Keys held down right now (Home Assistant's "pressed" sensors follow
+    /// this, not the event stream, so a lost event can't leave one stuck).
+    pub held_keys: BTreeSet<String>,
     /// History per sensor id. Shared, so cloning a view (the GUI does it
     /// every frame) doesn't copy an hour of samples for hundreds of sensors.
     pub history: Arc<BTreeMap<String, Series>>,
@@ -208,6 +211,61 @@ impl Handle {
         if self.cmd.send(Command::Shutdown(tx)).is_ok() {
             let _ = rx.recv_timeout(Duration::from_secs(4));
         }
+    }
+}
+
+/// A handle with no service behind it, for tests: commands land in the
+/// returned receiver.
+#[cfg(test)]
+pub fn test_handle(config: Config) -> (Handle, Receiver<Command>) {
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let shared = Arc::new(RwLock::new(Shared {
+        started: Instant::now(),
+        devices: BTreeMap::new(),
+        conflicts: Vec::new(),
+        mqtt: MqttStatus::Disabled,
+        system_sensors: Vec::new(),
+        ram_status: None,
+        sensor_status: Vec::new(),
+    }));
+    let h = Handle {
+        config: Arc::new(RwLock::new(config)),
+        shared,
+        cmd: tx,
+        listeners: Arc::new(Mutex::new(Vec::new())),
+        key_listeners: Arc::new(Mutex::new(Vec::new())),
+        quitting: Arc::new(AtomicBool::new(false)),
+        mqtt_done: Arc::new(AtomicBool::new(true)),
+        audio: crate::audio::Audio::default(),
+    };
+    (h, rx)
+}
+
+/// An empty view of a device, for tests.
+#[cfg(test)]
+pub fn test_view(info: DeviceInfo) -> DeviceView {
+    DeviceView {
+        info,
+        online: true,
+        sensors: Vec::new(),
+        controls: Vec::new(),
+        limits: Vec::new(),
+        fans: Vec::new(),
+        zones: Vec::new(),
+        led_layout: Vec::new(),
+        keymap_info: None,
+        keymap: BTreeMap::new(),
+        macros: None,
+        keymap_status: None,
+        lights: Vec::new(),
+        keys: Vec::new(),
+        last_key: None,
+        held_keys: BTreeSet::new(),
+        history: Arc::new(BTreeMap::new()),
+        stats: BTreeMap::new(),
+        hardware: Vec::new(),
+        last_error: None,
+        last_update: Some(Instant::now()),
     }
 }
 
@@ -550,6 +608,7 @@ fn worker(h: Handle, state: Arc<Mutex<State>>, mut dev: Box<dyn Device>, rx: Rec
             lights: Vec::new(),
             keys: keys.clone(),
             last_key: None,
+            held_keys: BTreeSet::new(),
             history: Arc::new(BTreeMap::new()),
             stats: BTreeMap::new(),
             hardware: Vec::new(),
@@ -595,6 +654,7 @@ fn worker(h: Handle, state: Arc<Mutex<State>>, mut dev: Box<dyn Device>, rx: Rec
                 if let Some(v) = h.shared.write().devices.get_mut(&id) {
                     v.online = false;
                 }
+                release_held(&h, &id);
                 let _ = done.send(());
                 return;
             }
@@ -763,6 +823,9 @@ fn worker(h: Handle, state: Arc<Mutex<State>>, mut dev: Box<dyn Device>, rx: Rec
                         v.controls = snap.controls;
                     }
                     drop(s);
+                    if !connected {
+                        release_held(&h, &id);
+                    }
                     h.notify();
                 }
                 Err(e) => {
@@ -788,6 +851,9 @@ fn fail(h: &Handle, id: &str, ws: &mut WorkerState, err: &str) -> bool {
             v.online = false;
         }
     }
+    if give_up {
+        release_held(h, id);
+    }
     h.notify();
     if give_up {
         log::warn!("{id}: giving up after repeated failures; will rescan");
@@ -795,12 +861,27 @@ fn fail(h: &Handle, id: &str, ws: &mut WorkerState, err: &str) -> bool {
     give_up
 }
 
+/// The device went away or offline: release whatever it had held, since
+/// its own release will never arrive.
+fn release_held(h: &Handle, id: &str) {
+    let held = h.shared.write().devices.get_mut(id).map(|v| std::mem::take(&mut v.held_keys)).unwrap_or_default();
+    for key in held {
+        log::debug!("{id}: {key} released (device offline)");
+        h.notify_key(&KeyEvent { device: id.into(), key, pressed: false });
+    }
+}
+
 fn on_key(h: &Handle, device: &str, key: &str, pressed: bool) {
+    if let Some(v) = h.shared.write().devices.get_mut(device) {
+        if pressed {
+            v.last_key = Some((key.to_string(), Instant::now()));
+            v.held_keys.insert(key.to_string());
+        } else {
+            v.held_keys.remove(key);
+        }
+    }
     if pressed {
         log::debug!("{device}: {key} pressed");
-        if let Some(v) = h.shared.write().devices.get_mut(device) {
-            v.last_key = Some((key.to_string(), Instant::now()));
-        }
         let action = h.config.read().key_action(device, key);
         crate::inject::run(action);
         h.notify();
@@ -995,5 +1076,40 @@ fn ram_config_changed(h: &Handle, workers: &mut Vec<Worker>, ram_scanned: &mut b
     };
     if changed {
         h.notify();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn going_offline_releases_held_keys() {
+        let (h, _cmds) = test_handle(Config::default());
+        let info = DeviceInfo {
+            id: "kb".into(),
+            kind: opendevicecontrol_core::DeviceKind::Keyboard,
+            manufacturer: String::new(),
+            model: "Board".into(),
+            vendor_string: None,
+            product_string: None,
+            usb_vid: 0,
+            usb_pid: 0,
+            serial: None,
+            firmware: None,
+        };
+        h.shared.write().devices.insert("kb".into(), test_view(info));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let ev = events.clone();
+        h.on_key(move |e| ev.lock().push((e.key.clone(), e.pressed)));
+
+        on_key(&h, "kb", "g1", true);
+        on_key(&h, "kb", "g2", true);
+        on_key(&h, "kb", "g2", false);
+        assert_eq!(h.shared.read().devices["kb"].held_keys.iter().collect::<Vec<_>>(), ["g1"]);
+        events.lock().clear();
+        release_held(&h, "kb");
+        assert!(h.shared.read().devices["kb"].held_keys.is_empty());
+        assert_eq!(*events.lock(), [("g1".to_string(), false)]);
     }
 }

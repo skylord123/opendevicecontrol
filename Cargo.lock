@@ -2887,6 +2887,7 @@ dependencies = [
  "eframe",
  "egui_plot",
  "evdev",
+ "flume",
  "gethostname",
  "gtk",
  "libpulse-binding",

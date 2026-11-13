@@ -252,6 +252,9 @@ pub struct AulaKeyboard {
     preview: Option<super::preview::Preview>,
     /// Host key currently held (cable only).
     host_key_down: Option<u16>,
+    /// Host key held when the link changed: its release never arrives, so
+    /// the next `poll_input` reports it.
+    released_by_switch: Option<u16>,
 }
 
 impl AulaKeyboard {
@@ -273,6 +276,7 @@ impl AulaKeyboard {
             last_sent: None,
             preview: None,
             host_key_down: None,
+            released_by_switch: None,
         };
         if kb.link.online() {
             kb.read_config();
@@ -309,6 +313,7 @@ impl AulaKeyboard {
         self.last_sent = None;
         if let Some(down) = self.host_key_down.take() {
             log::debug!("{}: host key {down} released by the link change", self.info.id);
+            self.released_by_switch = Some(down);
         }
         true
     }
@@ -665,6 +670,9 @@ impl Device for AulaKeyboard {
 
     fn poll_input(&mut self) -> Vec<InputEvent> {
         let mut out = Vec::new();
+        if let Some(k) = self.released_by_switch.take() {
+            out.push(InputEvent::Released(format!("host_key_{k}")));
+        }
         for e in self.link.poll_host_keys() {
             match e {
                 Some(n) if (1..=HOST_KEYS).contains(&n) => {

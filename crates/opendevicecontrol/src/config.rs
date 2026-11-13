@@ -71,7 +71,7 @@ pub fn migrate_legacy() -> bool {
 /// The id a retired device id now goes by: the Aula cable connection used
 /// to be a device of its own (`aula-f99-usb`), now both links are one
 /// keyboard under the plain id.
-fn merged_id(id: &str) -> Option<&'static str> {
+pub(crate) fn merged_id(id: &str) -> Option<&'static str> {
     use opendevicecontrol_core::vendors::aula::keyboard::{MODELS, RETIRED_IDS};
     RETIRED_IDS.contains(&id).then(|| MODELS.iter().find(|m| id.strip_suffix("-usb") == Some(m.slug)).map(|m| m.slug)).flatten()
 }

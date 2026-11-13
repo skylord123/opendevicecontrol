@@ -11,6 +11,7 @@ use crossbeam_channel::{select, Receiver};
 use opendevicecontrol_core::{ControlKind, ControlValue, SensorKind};
 use rumqttc::{Client, Event, LastWill, MqttOptions, Packet, QoS};
 use serde_json::{json, Map, Value};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -28,16 +29,29 @@ fn object_id(s: &opendevicecontrol_core::Sensor) -> String {
     }
 }
 
+/// How long an advertised entity's sensor (or control, key…) may be
+/// missing from its online device before its Home Assistant entity is
+/// removed: long enough for hotplug, a driver reset or a monitoring tool
+/// restarting.
+const MISSING_GRACE: Duration = Duration::from_secs(10 * 60);
+
 /// Whether `topic` is a retained message the previous name `name` left: a
 /// discovery config of this computer (`<prefix>/<component>/<name>_<node>_…/<obj>/config`)
-/// or anything under its old base topic (`<name>/…`).
+/// or anything under its old base topic (`<name>/<node>/…`). Other
+/// computers on the same broker keep theirs.
 fn legacy_topic(topic: &str, name: &str, prefix: &str, node: &str) -> bool {
-    if topic.starts_with(&format!("{name}/")) {
+    if topic.starts_with(&format!("{name}/{node}/")) {
         return true;
     }
     let Some(rest) = topic.strip_prefix(&format!("{prefix}/")) else { return false };
     let parts: Vec<&str> = rest.split('/').collect();
     matches!(parts.as_slice(), [_, id, _, "config"] if id.starts_with(&format!("{name}_{node}_")))
+}
+
+/// The energy counter in a retained state document, if it holds a valid one.
+fn energy_of(payload: &[u8]) -> Option<f64> {
+    let v: Value = serde_json::from_slice(payload).ok()?;
+    v.get("energy")?.as_f64().filter(|k| k.is_finite() && *k >= 0.0)
 }
 
 /// Device ids no longer used (merged into another device): their retained
@@ -142,6 +156,9 @@ pub fn start(h: Handle) {
                 continue;
             }
             h.mqtt_done.store(false, Ordering::Relaxed);
+            // Events queued while MQTT was off or reconnecting are stale;
+            // held state is re-read from the devices instead.
+            while key_rx.try_recv().is_ok() {}
             Session::new(&h, cfg).run(&tick_rx, &key_rx);
         })
         .expect("spawn mqtt");
@@ -198,8 +215,13 @@ impl Topics {
 enum Incoming {
     Connected,
     Disconnected(String),
-    Publish(String, Vec<u8>),
+    Publish { topic: String, payload: Vec<u8>, retain: bool },
 }
+
+/// Discovery configs advertised for one device: topic → payload as last
+/// accepted for sending, `None` when it has to be sent again (after a
+/// reconnect or a Home Assistant restart).
+type Advertised = HashMap<String, Option<String>>;
 
 struct Session<'a> {
     h: &'a Handle,
@@ -209,16 +231,25 @@ struct Session<'a> {
     events: Receiver<Incoming>,
     stop: Arc<AtomicBool>,
     connected: bool,
-    discovered: HashSet<String>,
-    /// Per device: sensor id → component (`sensor` / `binary_sensor`) whose
-    /// discovery config is published this session.
-    published: HashMap<String, HashMap<String, &'static str>>,
+    /// Per device, the discovery configs this run advertised. Only these
+    /// are ever removed when their entity goes away: the other OS of a
+    /// dual-boot machine shares the node id and may advertise more.
+    advertised: HashMap<String, Advertised>,
+    /// Advertised entities whose sensor/control is missing from its
+    /// (online) device, and since when.
+    missing: HashMap<String, Instant>,
     /// Discovery topics of sensors not sent, already cleared this session
     /// (removes entities of sensors the user switched off, even from an
     /// earlier run).
     cleared: HashSet<String>,
-    /// Devices whose retained energy value we already merged.
+    /// State topics whose retained energy value we already merged.
     seeded: HashSet<String>,
+    /// Held state ("pressed" sensors) per key state topic, as published.
+    held: HashMap<String, bool>,
+    /// Messages the client refused (queue full) since the last report.
+    dropped: Cell<u32>,
+    /// A legacy cleanup message could not be sent: try again next time.
+    legacy_failed: bool,
     /// Last light state published per device.
     last_light: std::collections::HashMap<String, Value>,
     /// On/off sensor values (locked, in use, charging…) as last published;
@@ -233,13 +264,17 @@ struct Session<'a> {
 }
 
 impl<'a> Session<'a> {
-    fn new(h: &'a Handle, cfg: Mqtt) -> Self {
+    fn topics(cfg: &Mqtt) -> Topics {
         let node = crate::config::sanitize_id(&cfg.node_id);
-        let t = Topics {
+        Topics {
             base: format!("{}/{}", cfg.base_topic.trim_end_matches('/'), node),
             prefix: cfg.discovery_prefix.trim_end_matches('/').to_string(),
             node,
-        };
+        }
+    }
+
+    fn new(h: &'a Handle, cfg: Mqtt) -> Self {
+        let t = Self::topics(&cfg);
         let mut opts = MqttOptions::new(format!("opendevicecontrol_{}", t.node), cfg.host.trim(), cfg.port);
         opts.set_keep_alive(Duration::from_secs(30));
         opts.set_max_packet_size(256 * 1024, 256 * 1024);
@@ -261,7 +296,9 @@ impl<'a> Session<'a> {
                     }
                     let msg = match ev {
                         Ok(Event::Incoming(Packet::ConnAck(_))) => Incoming::Connected,
-                        Ok(Event::Incoming(Packet::Publish(p))) => Incoming::Publish(p.topic.clone(), p.payload.to_vec()),
+                        Ok(Event::Incoming(Packet::Publish(p))) => {
+                            Incoming::Publish { topic: p.topic.clone(), payload: p.payload.to_vec(), retain: p.retain }
+                        }
                         Ok(_) => continue,
                         Err(e) => {
                             let _ = ev_tx.send(Incoming::Disconnected(e.to_string()));
@@ -278,18 +315,25 @@ impl<'a> Session<'a> {
             .expect("spawn mqtt io");
 
         set_status(h, MqttStatus::Connecting);
+        Self::with_client(h, cfg, client, events, stop)
+    }
+
+    fn with_client(h: &'a Handle, cfg: Mqtt, client: Client, events: Receiver<Incoming>, stop: Arc<AtomicBool>) -> Self {
         Self {
             h,
+            t: Self::topics(&cfg),
             cfg,
-            t,
             client,
             events,
             stop,
             connected: false,
-            discovered: HashSet::new(),
-            published: HashMap::new(),
+            advertised: HashMap::new(),
+            missing: HashMap::new(),
             cleared: HashSet::new(),
             seeded: HashSet::new(),
+            held: HashMap::new(),
+            dropped: Cell::new(0),
+            legacy_failed: false,
             last_light: std::collections::HashMap::new(),
             last_binary: std::collections::HashMap::new(),
             publish_after: Instant::now(),
@@ -308,14 +352,13 @@ impl<'a> Session<'a> {
                         log::warn!("MQTT: {e}");
                         set_status(self.h, MqttStatus::Error(e));
                     }
-                    Ok(Incoming::Publish(topic, payload)) => self.on_message(&topic, &payload),
+                    Ok(Incoming::Publish { topic, payload, retain }) => self.on_message(&topic, &payload, retain),
                     Err(_) => {}
                 },
                 recv(keys) -> k => if let (Ok(k), true) = (k, self.connected) {
                     // Sent immediately (not rate limited) so held-time
-                    // automations in HA are accurate.
-                    let held = if k.pressed { "ON" } else { "OFF" };
-                    let _ = self.client.try_publish(self.t.key_state(&k.device, &k.key), QoS::AtLeastOnce, true, held);
+                    // automations in HA are accurate. The held state
+                    // follows below, from the device's own record.
                     let event = if k.pressed { "press" } else { "release" };
                     self.pubj(self.t.key_event(&k.device, &k.key), &json!({"event_type": event}), false);
                 },
@@ -335,6 +378,9 @@ impl<'a> Session<'a> {
                 self.shutdown();
                 return;
             }
+            if self.connected {
+                self.sync_held();
+            }
             if self.connected && Instant::now() >= self.publish_after {
                 let urgent = self.binary_changed();
                 self.publish_states(urgent);
@@ -352,9 +398,49 @@ impl<'a> Session<'a> {
         let _ = self.client.try_disconnect();
     }
 
-    fn pubj(&self, topic: String, v: &Value, retain: bool) {
-        if let Err(e) = self.client.try_publish(topic, QoS::AtLeastOnce, retain, v.to_string()) {
-            log::warn!("MQTT publish: {e}");
+    /// Queue a publish; false when the client refused it (queue full or
+    /// closed), so the caller keeps it pending and tries again.
+    fn send(&self, topic: &str, payload: impl Into<Vec<u8>>, retain: bool) -> bool {
+        let ok = self.client.try_publish(topic, QoS::AtLeastOnce, retain, payload).is_ok();
+        if !ok {
+            self.dropped.set(self.dropped.get() + 1);
+        }
+        ok
+    }
+
+    fn pubj(&self, topic: String, v: &Value, retain: bool) -> bool {
+        self.send(&topic, v.to_string(), retain)
+    }
+
+    /// Send every advertised discovery config and key state again.
+    fn resend_all(&mut self) {
+        for adv in self.advertised.values_mut() {
+            adv.values_mut().for_each(|p| *p = None);
+        }
+        self.held.clear();
+        self.last_light.clear();
+    }
+
+    /// Publish the held state of every key whose state differs from what
+    /// was last published. Taken from the devices' own record, so a lost
+    /// event, a link change or the device going offline can't leave a key
+    /// stuck "pressed".
+    fn sync_held(&mut self) {
+        let t = &self.t;
+        let want: Vec<(String, bool)> = {
+            let shared = self.h.shared.read();
+            shared
+                .devices
+                .values()
+                .flat_map(|v| {
+                    v.keys.iter().map(move |k| (t.key_state(&v.info.id, &k.id), v.online && v.held_keys.contains(&k.id)))
+                })
+                .collect()
+        };
+        for (topic, held) in want {
+            if self.held.get(&topic) != Some(&held) && self.send(&topic, if held { "ON" } else { "OFF" }, true) {
+                self.held.insert(topic, held);
+            }
         }
     }
 
@@ -362,10 +448,8 @@ impl<'a> Session<'a> {
         log::info!("MQTT connected to {}:{}", self.cfg.host, self.cfg.port);
         self.connected = true;
         set_status(self.h, MqttStatus::Connected);
-        self.discovered.clear();
-        self.published.clear();
-        // Re-send every light state once after (re)connecting.
-        self.last_light.clear();
+        // Re-send discovery, key and light states once after (re)connecting.
+        self.resend_all();
         let _ = self.client.try_subscribe(format!("{}/+/set/+", self.t.base), QoS::AtLeastOnce);
         let _ = self.client.try_subscribe(format!("{}/status", self.t.prefix), QoS::AtLeastOnce);
         // Our own retained state: lets us resume the energy counter written by
@@ -386,8 +470,9 @@ impl<'a> Session<'a> {
         // entity ids (device + entity name) and the new ones get the same.
         if let Some(name) = self.cfg.legacy_cleanup.clone() {
             log::info!("MQTT: removing Home Assistant entries left by {name}");
-            let _ = self.client.try_subscribe(format!("{}/+/+/+/config", self.t.prefix), QoS::AtLeastOnce);
-            let _ = self.client.try_subscribe(format!("{name}/#"), QoS::AtLeastOnce);
+            let a = self.client.try_subscribe(format!("{}/+/+/+/config", self.t.prefix), QoS::AtLeastOnce);
+            let b = self.client.try_subscribe(format!("{name}/{}/#", self.t.node), QoS::AtLeastOnce);
+            self.legacy_failed = a.is_err() || b.is_err();
             let until = Instant::now() + Duration::from_secs(4);
             self.legacy = Some((name, until));
             self.publish_after = until + Duration::from_secs(2);
@@ -396,16 +481,38 @@ impl<'a> Session<'a> {
 
     /// During the cleanup window: clear a retained message of the previous
     /// name. Returns true if `topic` was one.
-    fn clear_legacy(&self, topic: &str, payload: &[u8]) -> bool {
+    fn clear_legacy(&mut self, topic: &str, payload: &[u8]) -> bool {
         let Some((name, _)) = &self.legacy else { return false };
-        if payload.is_empty() {
+        if payload.is_empty() || !legacy_topic(topic, name, &self.t.prefix, &self.t.node) {
             return false;
         }
-        let ours_before = legacy_topic(topic, name, &self.t.prefix, &self.t.node);
-        if ours_before {
-            let _ = self.client.try_publish(topic.to_string(), QoS::AtLeastOnce, true, "");
+        // The old state may carry the energy counter the other OS of a
+        // dual-boot machine kept: resume from it before it is deleted.
+        let old_dev = topic
+            .strip_prefix(&format!("{name}/{}/", self.t.node))
+            .and_then(|r| r.strip_suffix("/state"))
+            .filter(|d| !d.contains('/'))
+            .map(|d| crate::config::merged_id(d).unwrap_or(d).to_string());
+        if let Some(dev) = old_dev {
+            self.seed_energy(topic, &dev, payload);
         }
-        ours_before
+        if !self.send(topic, "", true) {
+            self.legacy_failed = true;
+        }
+        true
+    }
+
+    /// Resume a device's energy counter from a retained state document
+    /// (ours, or the other OS's). Each topic is used once it held a valid
+    /// value; the service keeps whichever counter is larger.
+    fn seed_energy(&mut self, topic: &str, dev: &str, payload: &[u8]) {
+        if self.seeded.contains(topic) {
+            return;
+        }
+        if let Some(kwh) = energy_of(payload) {
+            self.seeded.insert(topic.to_string());
+            let _ = self.h.cmd.send(Command::SeedEnergy { device: dev.to_string(), kwh });
+        }
     }
 
     /// End the cleanup window once it has passed.
@@ -415,14 +522,21 @@ impl<'a> Session<'a> {
             return;
         }
         let _ = self.client.try_unsubscribe(format!("{}/+/+/+/config", self.t.prefix));
-        let _ = self.client.try_unsubscribe(format!("{name}/#"));
+        let _ = self.client.try_unsubscribe(format!("{name}/{}/#", self.t.node));
+        if std::mem::take(&mut self.legacy_failed) {
+            // Not everything could be queued: keep the task for the next
+            // connection instead of marking it done.
+            log::warn!("MQTT: some entries left by {name} could not be removed; retrying on the next connection");
+            self.legacy = None;
+            return;
+        }
         log::info!("MQTT: entries left by {name} removed");
         self.legacy = None;
         self.cfg.legacy_cleanup = None;
         self.h.update_config(|c| c.mqtt.legacy_cleanup = None);
     }
 
-    fn on_message(&mut self, topic: &str, payload: &[u8]) {
+    fn on_message(&mut self, topic: &str, payload: &[u8], retain: bool) {
         if self.clear_legacy(topic, payload) {
             return;
         }
@@ -437,9 +551,7 @@ impl<'a> Session<'a> {
         if topic == format!("{}/status", self.t.prefix) {
             if text == "online" {
                 log::info!("Home Assistant restarted, re-sending discovery");
-                self.discovered.clear();
-                self.published.clear();
-                self.last_light.clear();
+                self.resend_all();
                 self.publish_after = Instant::now() + Duration::from_secs(1);
             }
             return;
@@ -447,13 +559,10 @@ impl<'a> Session<'a> {
         let Some(rest) = topic.strip_prefix(&format!("{}/", self.t.base)) else { return };
         let parts: Vec<&str> = rest.split('/').collect();
         match parts.as_slice() {
-            [dev, "state"] => {
-                if self.seeded.insert(dev.to_string()) {
-                    if let Some(kwh) = serde_json::from_str::<Value>(&text).ok().and_then(|v| v.get("energy")?.as_f64()) {
-                        let _ = self.h.cmd.send(Command::SeedEnergy { device: dev.to_string(), kwh });
-                    }
-                }
-            }
+            [dev, "state"] => self.seed_energy(topic, dev, payload),
+            // A retained command is an old one the broker replays on every
+            // (re)connect, not something asked for now.
+            [dev, "set", ctrl] if retain => log::info!("ignoring retained HA command {dev}/{ctrl}"),
             [dev, "set", ctrl] => self.on_command(dev, ctrl, &text),
             _ => {}
         }
@@ -580,8 +689,8 @@ impl<'a> Session<'a> {
         m
     }
 
-    /// Discovery config of one sensor; returns its component.
-    fn sensor_discovery(&self, v: &DeviceView, s: &opendevicecontrol_core::Sensor) -> &'static str {
+    /// Discovery config of one sensor: (topic, payload).
+    fn sensor_config(&self, v: &DeviceView, s: &opendevicecontrol_core::Sensor) -> (String, Value) {
         let dev = &v.info.id;
         // Detail sensors of This PC's tree are named after their hardware
         // ("CPU Package" is ambiguous; "AMD Ryzen 7 7800X3D Package" isn't).
@@ -602,8 +711,7 @@ impl<'a> Session<'a> {
             if s.diagnostic {
                 m.insert("entity_category".into(), json!("diagnostic"));
             }
-            self.pubj(self.t.discovery("sensor", dev, &obj), &Value::Object(m), true);
-            return "sensor";
+            return (self.t.discovery("sensor", dev, &obj), Value::Object(m));
         }
         {
             let s = &opendevicecontrol_core::Sensor { name, ..s.clone() };
@@ -628,8 +736,7 @@ impl<'a> Session<'a> {
                 if s.diagnostic {
                     m.insert("entity_category".into(), json!("diagnostic"));
                 }
-                self.pubj(self.t.discovery("binary_sensor", dev, &obj), &Value::Object(m), true);
-                return "binary_sensor";
+                return (self.t.discovery("binary_sensor", dev, &obj), Value::Object(m));
             }
             m.insert("value_template".into(), json!(format!("{{{{ {} }}}}", value_of(&s.id))));
             let (class, state_class, icon): (Option<&str>, &str, Option<&str>) = match s.kind {
@@ -669,54 +776,129 @@ impl<'a> Session<'a> {
             if s.diagnostic {
                 m.insert("entity_category".into(), json!("diagnostic"));
             }
-            self.pubj(self.t.discovery("sensor", dev, &s.id), &Value::Object(m), true);
-            "sensor"
+            (self.t.discovery("sensor", dev, &s.id), Value::Object(m))
         }
     }
 
-    /// Bring the published sensor entities of a device in line with the
-    /// user's choice: add newly chosen or newly appeared sensors, remove
-    /// the others. At most `budget` removals per call (the MQTT queue is
-    /// bounded and a PC has hundreds of sensors).
-    fn sync_sensors(&mut self, v: &DeviceView, cfg: &crate::config::Config, budget: &mut usize) {
+    /// Bring a device's Home Assistant entities in line with what it has
+    /// now and what the user chose to send: advertise new or changed ones,
+    /// remove ones switched off right away and ones whose sensor, control
+    /// or key went away after [`MISSING_GRACE`] (never while the device is
+    /// offline). Bookkeeping only advances for messages the client
+    /// accepted, so anything refused is tried again next time. At most
+    /// `budget` removals per call (the MQTT queue is bounded and a PC has
+    /// hundreds of sensors).
+    fn sync_device(&mut self, v: &DeviceView, cfg: &crate::config::Config, budget: &mut usize) {
         let dev = v.info.id.clone();
-        let mut have = self.published.remove(&dev).unwrap_or_default();
+        let mut want: Vec<(String, Value)> = self.device_configs(v);
+        let mut unwanted = HashSet::new();
         for s in &v.sensors {
             let comp = if s.kind.is_binary() { "binary_sensor" } else { "sensor" };
             let obj = object_id(s);
-            let wanted = cfg.sends(&dev, s);
             if obj != s.id && *budget > 0 {
                 // Earlier versions published it under its own id (as a
                 // duration, or as a lock with the opposite meaning).
                 let old = self.t.discovery(comp, &dev, &s.id);
-                if self.cleared.insert(old.clone()) {
+                if !self.cleared.contains(&old) {
                     *budget -= 1;
-                    let _ = self.client.try_publish(old, QoS::AtLeastOnce, true, "");
-                }
-            }
-            if wanted && !have.contains_key(&s.id) {
-                let comp = self.sensor_discovery(v, s);
-                have.insert(s.id.clone(), comp);
-                self.cleared.remove(&self.t.discovery(comp, &dev, &obj));
-            } else if !wanted {
-                if let Some(c) = have.remove(&s.id) {
-                    let topic = self.t.discovery(c, &dev, &obj);
-                    let _ = self.client.try_publish(topic.clone(), QoS::AtLeastOnce, true, "");
-                    self.cleared.insert(topic);
-                } else if *budget > 0 {
-                    let topic = self.t.discovery(comp, &dev, &obj);
-                    if self.cleared.insert(topic.clone()) {
-                        *budget -= 1;
-                        let _ = self.client.try_publish(topic, QoS::AtLeastOnce, true, "");
+                    if self.send(&old, "", true) {
+                        self.cleared.insert(old);
                     }
                 }
             }
+            if cfg.sends(&dev, s) {
+                want.push(self.sensor_config(v, s));
+            } else {
+                unwanted.insert(self.t.discovery(comp, &dev, &obj));
+            }
         }
-        self.published.insert(dev, have);
+
+        let mut adv = self.advertised.remove(&dev).unwrap_or_default();
+        let wanted: HashSet<String> = want.iter().map(|(t, _)| t.clone()).collect();
+        for (topic, config) in want {
+            self.missing.remove(&topic);
+            let config = config.to_string();
+            if adv.get(&topic).is_some_and(|p| p.as_ref() == Some(&config)) {
+                continue;
+            }
+            if self.send(&topic, config.clone(), true) {
+                self.cleared.remove(&topic);
+                adv.insert(topic, Some(config));
+            }
+        }
+        let now = Instant::now();
+        let stale: Vec<String> = adv.keys().filter(|t| !wanted.contains(*t)).cloned().collect();
+        for topic in stale {
+            let remove = if unwanted.contains(&topic) {
+                true
+            } else if !v.online {
+                // Hardware that is away keeps its entities.
+                self.missing.remove(&topic);
+                false
+            } else {
+                now.duration_since(*self.missing.entry(topic.clone()).or_insert(now)) >= MISSING_GRACE
+            };
+            if remove && *budget > 0 {
+                *budget -= 1;
+                if self.send(&topic, "", true) {
+                    adv.remove(&topic);
+                    self.missing.remove(&topic);
+                    self.cleared.insert(topic);
+                }
+            }
+        }
+        // Sensors switched off before this run: clear what an earlier run
+        // may have left.
+        for topic in unwanted {
+            if !adv.contains_key(&topic) && !self.cleared.contains(&topic) && *budget > 0 {
+                *budget -= 1;
+                if self.send(&topic, "", true) {
+                    self.cleared.insert(topic);
+                }
+            }
+        }
+        self.advertised.insert(dev, adv);
     }
 
-    fn publish_discovery(&self, v: &DeviceView) {
+    /// A device this run advertised is gone from the service (e.g. RAM
+    /// support switched off): remove its entities and retained topics.
+    /// Returns true once everything is cleared.
+    fn forget_device(&mut self, dev: &str, budget: &mut usize) -> bool {
+        let Some(mut adv) = self.advertised.remove(dev) else { return true };
+        let topics: Vec<String> = adv.keys().cloned().collect();
+        for topic in topics {
+            if *budget == 0 {
+                break;
+            }
+            *budget -= 1;
+            if self.send(&topic, "", true) {
+                adv.remove(&topic);
+                self.missing.remove(&topic);
+            }
+        }
+        let keys: Vec<String> = self.held.keys().filter(|t| t.starts_with(&format!("{}/{dev}/key/", self.t.base))).cloned().collect();
+        for topic in keys {
+            if self.send(&topic, "", true) {
+                self.held.remove(&topic);
+            }
+        }
+        if adv.is_empty() && !self.held.keys().any(|t| t.starts_with(&format!("{}/{dev}/key/", self.t.base))) {
+            let topics = [self.t.availability(dev), self.t.state(dev), self.t.light_state(dev)];
+            if topics.iter().map(|t| self.send(t, "", true)).fold(true, |a, b| a & b) {
+                log::info!("MQTT: removed {dev} from Home Assistant (no longer present)");
+                self.last_light.remove(dev);
+                return true;
+            }
+        }
+        self.advertised.insert(dev.to_string(), adv);
+        false
+    }
+
+    /// Discovery configs of a device's controls, lighting, keys and fans:
+    /// (topic, payload).
+    fn device_configs(&self, v: &DeviceView) -> Vec<(String, Value)> {
         let dev = &v.info.id;
+        let mut out = Vec::new();
         for c in &v.controls {
             match &c.kind {
                 ControlKind::Choice { options } => {
@@ -726,7 +908,7 @@ impl<'a> Session<'a> {
                     m.insert("value_template".into(), json!(format!("{{{{ {} }}}}", value_of(&c.id))));
                     m.insert("entity_category".into(), json!("config"));
                     m.insert("icon".into(), json!(control_icon(c)));
-                    self.pubj(self.t.discovery("select", dev, &c.id), &Value::Object(m), true);
+                    out.push((self.t.discovery("select", dev, &c.id), Value::Object(m)));
                 }
                 ControlKind::Toggle => {
                     let mut m = self.common(v, &c.id, &c.name);
@@ -736,7 +918,7 @@ impl<'a> Session<'a> {
                     m.insert("payload_off".into(), json!("OFF"));
                     m.insert("entity_category".into(), json!("config"));
                     m.insert("icon".into(), json!(control_icon(c)));
-                    self.pubj(self.t.discovery("switch", dev, &c.id), &Value::Object(m), true);
+                    out.push((self.t.discovery("switch", dev, &c.id), Value::Object(m)));
                 }
                 ControlKind::Number { min, max, step, unit } => {
                     let mut m = self.common(v, &c.id, &c.name);
@@ -754,7 +936,7 @@ impl<'a> Session<'a> {
                     }
                     m.insert("entity_category".into(), json!("config"));
                     m.insert("icon".into(), json!(control_icon(c)));
-                    self.pubj(self.t.discovery("number", dev, &c.id), &Value::Object(m), true);
+                    out.push((self.t.discovery("number", dev, &c.id), Value::Object(m)));
                 }
             }
         }
@@ -772,7 +954,7 @@ impl<'a> Session<'a> {
             m.insert("effect".into(), json!(true));
             m.insert("effect_list".into(), json!(Effect::NAMES));
             m.insert("icon".into(), json!("mdi:led-strip-variant"));
-            self.pubj(self.t.discovery("light", dev, "lighting"), &Value::Object(m), true);
+            out.push((self.t.discovery("light", dev, "lighting"), Value::Object(m)));
         }
 
         // Keys, two entities each:
@@ -786,7 +968,7 @@ impl<'a> Session<'a> {
             m.insert("event_types".into(), json!(["press", "release"]));
             m.insert("device_class".into(), json!("button"));
             m.insert("icon".into(), json!("mdi:gesture-tap-button"));
-            self.pubj(self.t.discovery("event", dev, &obj), &Value::Object(m), true);
+            out.push((self.t.discovery("event", dev, &obj), Value::Object(m)));
 
             let obj = format!("key_{}_pressed", k.id);
             let mut m = self.common(v, &obj, &format!("{} pressed", k.name));
@@ -794,9 +976,7 @@ impl<'a> Session<'a> {
             m.insert("payload_on".into(), json!("ON"));
             m.insert("payload_off".into(), json!("OFF"));
             m.insert("icon".into(), json!("mdi:keyboard"));
-            self.pubj(self.t.discovery("binary_sensor", dev, &obj), &Value::Object(m), true);
-            // Keys are not held when we (re)connect.
-            let _ = self.client.try_publish(self.t.key_state(dev, &k.id), QoS::AtLeastOnce, true, "OFF");
+            out.push((self.t.discovery("binary_sensor", dev, &obj), Value::Object(m)));
         }
 
         for ch in &v.fans {
@@ -806,7 +986,7 @@ impl<'a> Session<'a> {
             m.insert("options".into(), json!(FanPolicy::MODES));
             m.insert("value_template".into(), json!(format!("{{{{ {} }}}}", value_of(&mode_id))));
             m.insert("icon".into(), json!("mdi:fan-auto"));
-            self.pubj(self.t.discovery("select", dev, &mode_id), &Value::Object(m), true);
+            out.push((self.t.discovery("select", dev, &mode_id), Value::Object(m)));
 
             let duty_id = format!("{}_fixed_duty", ch.id);
             let mut m = self.common(v, &duty_id, &format!("{} fixed duty", ch.name));
@@ -818,8 +998,9 @@ impl<'a> Session<'a> {
             m.insert("mode".into(), json!("slider"));
             m.insert("unit_of_measurement".into(), json!("%"));
             m.insert("icon".into(), json!("mdi:fan"));
-            self.pubj(self.t.discovery("number", dev, &duty_id), &Value::Object(m), true);
+            out.push((self.t.discovery("number", dev, &duty_id), Value::Object(m)));
         }
+        out
     }
 
     /// True when any device's on/off sensor (locked, in use…) changed since
@@ -854,16 +1035,17 @@ impl<'a> Session<'a> {
         let devices: Vec<DeviceView> = self.h.shared.read().devices.values().cloned().collect();
         let cfg = self.h.config.read().clone();
         let mut budget = 200;
+        let gone: Vec<String> =
+            self.advertised.keys().filter(|d| !devices.iter().any(|v| &v.info.id == *d)).cloned().collect();
+        for dev in gone {
+            self.forget_device(&dev, &mut budget);
+        }
         for v in &devices {
             let dev = v.info.id.clone();
             if v.last_update.is_none() {
                 continue; // not read yet
             }
-            if !self.discovered.contains(&dev) {
-                self.publish_discovery(v);
-                self.discovered.insert(dev.clone());
-            }
-            self.sync_sensors(v, &cfg, &mut budget);
+            self.sync_device(v, &cfg, &mut budget);
             let _ = self.client.try_publish(
                 self.t.availability(&dev),
                 QoS::AtLeastOnce,
@@ -902,6 +1084,10 @@ impl<'a> Session<'a> {
             self.pubj(self.t.state(&dev), &Value::Object(st), true);
         }
         self.publish_lights(false);
+        let dropped = self.dropped.replace(0);
+        if dropped > 0 {
+            log::warn!("MQTT: {dropped} messages not queued (queue full); retrying");
+        }
     }
 
     /// Publish each device's light state when it changed (or `force`), so
@@ -911,7 +1097,9 @@ impl<'a> Session<'a> {
             self.h.shared.read().devices.values().map(|v| (v.info.id.clone(), !v.zones.is_empty())).collect();
         let cfg = self.h.config.read().clone();
         for (dev, has_lights) in devices {
-            if !has_lights || !self.discovered.contains(&dev) {
+            // Only once its light entity is advertised on this connection.
+            let light = self.t.discovery("light", &dev, "lighting");
+            if !has_lights || !self.advertised.get(&dev).and_then(|a| a.get(&light)).is_some_and(Option::is_some) {
                 continue;
             }
             let l = cfg.lighting(&dev);
@@ -923,8 +1111,7 @@ impl<'a> Session<'a> {
                 "color": {"r": c.r, "g": c.g, "b": c.b},
                 "effect": l.effect.name(),
             });
-            if force || self.last_light.get(&dev) != Some(&st) {
-                self.pubj(self.t.light_state(&dev), &st, true);
+            if (force || self.last_light.get(&dev) != Some(&st)) && self.pubj(self.t.light_state(&dev), &st, true) {
                 self.last_light.insert(dev, st);
             }
         }
@@ -950,7 +1137,9 @@ mod tests {
         assert_eq!(object_id(&s), "last_input");
         // Cleanup after a rename touches only the old name's own retained topics.
         assert!(legacy_topic("homeassistant/sensor/rigmeld_my_pc_this_pc/cpu_load/config", "rigmeld", "homeassistant", "my_pc"));
-        assert!(legacy_topic("rigmeld/this_pc/state", "rigmeld", "homeassistant", "my_pc"));
+        assert!(legacy_topic("rigmeld/my_pc/this_pc/state", "rigmeld", "homeassistant", "my_pc"));
+        assert!(!legacy_topic("rigmeld/other_pc/this_pc/state", "rigmeld", "homeassistant", "my_pc"));
+        assert!(!legacy_topic("rigmeld/my_pcx/this_pc/state", "rigmeld", "homeassistant", "my_pc"));
         assert!(!legacy_topic("homeassistant/sensor/rigmeld_other_pc_this_pc/cpu_load/config", "rigmeld", "homeassistant", "my_pc"));
         assert!(!legacy_topic("homeassistant/sensor/opendevicecontrol_my_pc_this_pc/cpu_load/config", "rigmeld", "homeassistant", "my_pc"));
         assert!(!legacy_topic("homeassistant/sensor/zigbee_thing/temp/config", "rigmeld", "homeassistant", "my_pc"));
@@ -963,5 +1152,237 @@ mod tests {
         let l = opendevicecontrol_core::Sensor::new("locked", "Locked", SensorKind::State, 1.0).class("lock");
         assert_eq!(object_id(&l), "locked_lock");
         assert_eq!(value_of("12v"), "value_json['12v']");
+    }
+
+    use crate::config::Config;
+    use crate::service::{test_handle, test_view};
+    use opendevicecontrol_core::{Control, DeviceInfo, DeviceKind, InputKey, LightZone, Sensor};
+
+    const BASE: &str = "opendevicecontrol/my_pc";
+
+    /// A session on a client whose queue holds `cap` messages and is read
+    /// by the test instead of a broker.
+    fn session(h: &Handle, cap: usize) -> (Session<'_>, flume::Receiver<rumqttc::Request>) {
+        let (tx, rx) = flume::bounded(cap);
+        let cfg = Mqtt { node_id: "my_pc".into(), ..Mqtt::default() };
+        let (_ev_tx, events) = crossbeam_channel::unbounded();
+        let mut s = Session::with_client(h, cfg, Client::from_sender(tx), events, Arc::new(AtomicBool::new(false)));
+        s.connected = true;
+        (s, rx)
+    }
+
+    /// Queued publishes: (topic, payload).
+    fn drain(rx: &flume::Receiver<rumqttc::Request>) -> Vec<(String, String)> {
+        rx.try_iter()
+            .filter_map(|r| match r {
+                rumqttc::Request::Publish(p) => Some((p.topic, String::from_utf8_lossy(&p.payload).into_owned())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn device(id: &str) -> DeviceView {
+        let info = DeviceInfo {
+            id: id.into(),
+            kind: DeviceKind::Keyboard,
+            manufacturer: "Test".into(),
+            model: "Board".into(),
+            vendor_string: None,
+            product_string: None,
+            usb_vid: 0,
+            usb_pid: 0,
+            serial: None,
+            firmware: None,
+        };
+        let mut v = test_view(info);
+        v.sensors = vec![
+            Sensor::new("temp", "Temperature", SensorKind::Temperature, 40.0),
+            Sensor::new("power", "Power", SensorKind::Power, 10.0),
+            Sensor::new("energy", "Energy", SensorKind::Energy, 1.0),
+        ];
+        v.controls = vec![Control {
+            id: "sound".into(),
+            name: "Sound".into(),
+            kind: ControlKind::Toggle,
+            value: ControlValue::Bool(false),
+            help: None,
+        }];
+        v.zones = vec![LightZone { id: "keys".into(), name: "Keys".into(), leds: 1 }];
+        v.keys = vec![InputKey { id: "g1".into(), name: "G1".into(), assignable: true }];
+        v
+    }
+
+    fn config_topic(component: &str, obj: &str) -> String {
+        format!("homeassistant/{component}/opendevicecontrol_my_pc_kb/{obj}/config")
+    }
+
+    fn cleared(sent: &[(String, String)], topic: &str) -> bool {
+        sent.iter().any(|(t, p)| t == topic && p.is_empty())
+    }
+
+    #[test]
+    fn refused_publishes_are_retried_until_everything_converges() {
+        let (h, _cmds) = test_handle(Config::default());
+        h.shared.write().devices.insert("kb".into(), device("kb"));
+        // Far less room than one cycle needs (the real queue holds 2048).
+        let (mut s, rx) = session(&h, 3);
+        let mut seen = HashSet::new();
+        for _ in 0..20 {
+            s.publish_states(true);
+            seen.extend(drain(&rx).into_iter().map(|(t, _)| t));
+        }
+        for t in [
+            config_topic("sensor", "temp"),
+            config_topic("sensor", "power"),
+            config_topic("sensor", "energy"),
+            config_topic("switch", "sound"),
+            config_topic("light", "lighting"),
+            config_topic("event", "key_g1"),
+            config_topic("binary_sensor", "key_g1_pressed"),
+            format!("{BASE}/kb/light"),
+            format!("{BASE}/kb/state"),
+        ] {
+            assert!(seen.contains(&t), "{t} never sent");
+        }
+        // Nothing is re-sent once accepted.
+        s.publish_states(true);
+        assert!(drain(&rx).iter().all(|(t, _)| !t.ends_with("/config")));
+    }
+
+    #[test]
+    fn entities_follow_the_device() {
+        let (h, _cmds) = test_handle(Config::default());
+        h.shared.write().devices.insert("kb".into(), device("kb"));
+        let (mut s, rx) = session(&h, 4096);
+        s.publish_states(true);
+        drain(&rx);
+
+        // A control that appears later is advertised.
+        h.shared.write().devices.get_mut("kb").unwrap().controls.push(Control {
+            id: "mic".into(),
+            name: "Mic".into(),
+            kind: ControlKind::Toggle,
+            value: ControlValue::Bool(true),
+            help: None,
+        });
+        s.publish_states(true);
+        assert!(drain(&rx).iter().any(|(t, p)| t == &config_topic("switch", "mic") && !p.is_empty()));
+
+        // A sensor that goes away stays during the grace period…
+        h.shared.write().devices.get_mut("kb").unwrap().sensors.retain(|x| x.id != "power");
+        s.publish_states(true);
+        assert!(!cleared(&drain(&rx), &config_topic("sensor", "power")));
+        // …is kept while the device is offline…
+        h.shared.write().devices.get_mut("kb").unwrap().online = false;
+        s.publish_states(true);
+        assert!(!cleared(&drain(&rx), &config_topic("sensor", "power")));
+        assert!(!s.missing.contains_key(&config_topic("sensor", "power")));
+        // …and is removed once missing that long from an online device.
+        h.shared.write().devices.get_mut("kb").unwrap().online = true;
+        s.publish_states(true);
+        drain(&rx);
+        let Some(long_ago) = Instant::now().checked_sub(MISSING_GRACE + Duration::from_secs(1)) else { return };
+        s.missing.insert(config_topic("sensor", "power"), long_ago);
+        s.publish_states(true);
+        assert!(cleared(&drain(&rx), &config_topic("sensor", "power")));
+
+        // A sensor the user switches off goes right away.
+        h.config.write().ha_sensors.insert("kb/temp".into(), false);
+        s.publish_states(true);
+        assert!(cleared(&drain(&rx), &config_topic("sensor", "temp")));
+
+        // A device removed from the service loses its entities and topics,
+        // and nothing it never advertised is touched.
+        h.shared.write().devices.remove("kb");
+        s.publish_states(true);
+        let sent = drain(&rx);
+        for t in [config_topic("sensor", "energy"), config_topic("switch", "sound"), format!("{BASE}/kb/availability")] {
+            assert!(cleared(&sent, &t), "{t} not cleared");
+        }
+        assert!(!cleared(&sent, &config_topic("sensor", "power")), "cleared twice");
+        assert!(sent.iter().all(|(t, p)| p.is_empty() && (t.contains("_kb/") || t.starts_with(&format!("{BASE}/kb/")))));
+        assert!(s.advertised.is_empty());
+    }
+
+    #[test]
+    fn energy_seeding_and_legacy_cleanup() {
+        let (h, cmds) = test_handle(Config::default());
+        let (mut s, rx) = session(&h, 64);
+        let seeds = || -> Vec<f64> {
+            cmds.try_iter()
+                .filter_map(|c| match c {
+                    Command::SeedEnergy { kwh, .. } => Some(kwh),
+                    _ => None,
+                })
+                .collect()
+        };
+        let state = format!("{BASE}/psu/state");
+        s.on_message(&state, b"not json", true);
+        s.on_message(&state, br#"{"power": 3}"#, true);
+        s.on_message(&state, br#"{"energy": -1}"#, true);
+        assert!(seeds().is_empty());
+        s.on_message(&state, br#"{"energy": 12.5}"#, true);
+        s.on_message(&state, br#"{"energy": 13.0}"#, false);
+        assert_eq!(seeds(), [12.5]);
+
+        // Cleanup of a previous name: this computer's topics only, and the
+        // old energy counter is resumed before it is deleted.
+        s.legacy = Some(("rigmeld".into(), Instant::now() + Duration::from_secs(60)));
+        s.on_message("rigmeld/other_pc/psu/state", br#"{"energy": 99.0}"#, true);
+        s.on_message("homeassistant/sensor/rigmeld_other_pc_psu/power/config", b"{}", true);
+        assert!(drain(&rx).is_empty());
+        assert!(seeds().is_empty());
+        s.on_message("rigmeld/my_pc/psu/state", br#"{"energy": 20.0}"#, true);
+        s.on_message("homeassistant/sensor/rigmeld_my_pc_psu/power/config", b"{}", true);
+        assert_eq!(seeds(), [20.0]);
+        let sent = drain(&rx);
+        assert!(cleared(&sent, "rigmeld/my_pc/psu/state"));
+        assert!(cleared(&sent, "homeassistant/sensor/rigmeld_my_pc_psu/power/config"));
+
+        // A cleanup that could not be queued is not marked done.
+        s.legacy_failed = true;
+        s.cfg.legacy_cleanup = Some("rigmeld".into());
+        s.legacy = Some(("rigmeld".into(), Instant::now()));
+        s.finish_legacy();
+        assert!(s.legacy.is_none());
+        assert_eq!(s.cfg.legacy_cleanup.as_deref(), Some("rigmeld"));
+    }
+
+    #[test]
+    fn retained_commands_are_ignored() {
+        let (h, cmds) = test_handle(Config::default());
+        h.shared.write().devices.insert("kb".into(), device("kb"));
+        let (mut s, _rx) = session(&h, 64);
+        let topic = format!("{BASE}/kb/set/sound");
+        s.on_message(&topic, b"ON", true);
+        assert!(cmds.try_iter().all(|c| !matches!(c, Command::SetControl { .. })));
+        s.on_message(&topic, b"ON", false);
+        assert!(cmds.try_iter().any(|c| matches!(c, Command::SetControl { id, .. } if id == "sound")));
+    }
+
+    #[test]
+    fn held_keys_follow_the_device() {
+        let (h, _cmds) = test_handle(Config::default());
+        h.shared.write().devices.insert("kb".into(), device("kb"));
+        let held = format!("{BASE}/kb/key/g1/held");
+        let (mut s, rx) = session(&h, 1);
+        // Released at first.
+        s.sync_held();
+        assert_eq!(drain(&rx), [(held.clone(), "OFF".to_string())]);
+        // Pressed, but the queue is full: published once there is room.
+        h.shared.write().devices.get_mut("kb").unwrap().held_keys.insert("g1".into());
+        assert!(s.send("filler", "", false));
+        s.sync_held();
+        drain(&rx);
+        s.sync_held();
+        assert_eq!(drain(&rx), [(held.clone(), "ON".to_string())]);
+        // A reconnect during the hold re-sends it as held, not released.
+        s.resend_all();
+        s.sync_held();
+        assert_eq!(drain(&rx), [(held.clone(), "ON".to_string())]);
+        // The device dropping off releases it even without a release event.
+        h.shared.write().devices.get_mut("kb").unwrap().online = false;
+        s.sync_held();
+        assert_eq!(drain(&rx), [(held, "OFF".to_string())]);
     }
 }
