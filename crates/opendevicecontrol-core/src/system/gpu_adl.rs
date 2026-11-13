@@ -10,7 +10,7 @@
 
 use crate::model::SensorKind;
 use std::ffi::c_void;
-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
 
 const ADL_MAX_PATH: usize = 256;
 const ADL_PMLOG_MAX_SENSORS: usize = 256;
@@ -124,7 +124,9 @@ impl AdlGpus {
         // SAFETY: loading a system DLL by name and looking up its exports;
         // each is transmuted to its documented signature.
         unsafe {
-            let lib = LoadLibraryW(dll.as_ptr());
+            // System32 only (the driver installs it there), never the
+            // current directory or PATH.
+            let lib = LoadLibraryExW(dll.as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32);
             if lib.is_null() {
                 return None;
             }

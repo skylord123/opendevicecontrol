@@ -39,11 +39,17 @@ enum Pawn {
     Failed(String),
 }
 
+/// The cached readings. Only ever locked briefly: the sources are queried
+/// without it (see [`ensure_fresh`]), so a slow or stuck source never holds
+/// up This PC, the device manager or settings changes.
 struct State {
     settings: Settings,
     at: Option<Instant>,
     trees: Vec<ExtTree>,
-    pawn: Pawn,
+    /// Start PawnIO over on the next refresh (it was switched on or off).
+    pawn_reset: bool,
+    /// PawnIO's status line, if it has one.
+    pawn_line: Option<String>,
     lhm_http_next: Instant,
     lhm_wmi_next: Instant,
     /// When to look for the sensor service again (it isn't installed).
@@ -52,6 +58,9 @@ struct State {
     service: Result<Vec<String>, String>,
     /// Sources that answered on the last refresh.
     active: Vec<String>,
+    /// Bumped by [`configure`] and [`rescan`], so a refresh that started
+    /// before them doesn't undo what they set.
+    generation: u64,
 }
 
 fn state() -> MutexGuard<'static, State> {
@@ -61,28 +70,35 @@ fn state() -> MutexGuard<'static, State> {
             settings: Settings::default(),
             at: None,
             trees: Vec::new(),
-            pawn: Pawn::Off,
+            pawn_reset: false,
+            pawn_line: None,
             lhm_http_next: now,
             lhm_wmi_next: now,
             service_next: now,
             service: Err("not installed".into()),
             active: Vec::new(),
+            generation: 0,
         })
     });
     // A panic while refreshing leaves usable data behind; ignore poisoning.
     STATE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Held by the one thread that is querying the sources; it also owns the
+/// in-process PawnIO reader.
+static REFRESHING: LazyLock<Mutex<Pawn>> = LazyLock::new(|| Mutex::new(Pawn::Off));
+
 /// Apply settings (from the config file). Switching PawnIO on retries it.
 pub fn configure(settings: Settings) {
     let mut s = state();
     if s.settings != settings {
         if s.settings.pawnio != settings.pawnio {
-            s.pawn = Pawn::Off;
+            s.pawn_reset = true;
         }
         s.settings = settings;
         s.at = None;
         s.lhm_http_next = Instant::now();
+        s.generation += 1;
     }
 }
 
@@ -94,35 +110,26 @@ pub fn rescan() {
     s.service_next = now;
     s.lhm_http_next = now;
     s.lhm_wmi_next = now;
+    s.generation += 1;
 }
 
 /// Hardware trees from the available sources, in priority order: PawnIO,
 /// then HWiNFO or (when HWiNFO isn't sharing) LibreHardwareMonitor.
 pub fn trees() -> Vec<ExtTree> {
-    let mut s = state();
-    if s.at.is_none_or(|t| t.elapsed() >= CACHE) {
-        refresh(&mut s);
-    }
-    s.trees.clone()
+    ensure_fresh(|s| s.at.is_none_or(|t| t.elapsed() >= CACHE));
+    state().trees.clone()
 }
 
 /// One line per source, for Settings and `--probe`.
 pub fn status() -> Vec<String> {
-    let mut s = state();
-    if s.at.is_none() {
-        refresh(&mut s);
-    }
+    ensure_fresh(|s| s.at.is_none());
+    let s = state();
     let mut v = Vec::new();
     match &s.service {
         Ok(lines) => v.extend(lines.iter().map(|l| format!("Sensor service: {l}"))),
         Err(e) => v.push(format!("Sensor service: {e}")),
     }
-    match &s.pawn {
-        Pawn::Off if s.settings.pawnio || s.service.is_ok() => {}
-        Pawn::Off => v.push("PawnIO: off".to_string()),
-        Pawn::Ready(c) => v.push(format!("PawnIO: reading {}", c.describe())),
-        Pawn::Failed(e) => v.push(format!("PawnIO: {e}")),
-    }
+    v.extend(s.pawn_line.clone());
     let others: Vec<&String> = s.active.iter().filter(|a| *a != "PawnIO" && *a != "Sensor service").collect();
     if others.is_empty() {
         v.push("HWiNFO / LibreHardwareMonitor: not running or not sharing sensors".into());
@@ -132,31 +139,68 @@ pub fn status() -> Vec<String> {
     v
 }
 
-fn refresh(s: &mut State) {
+/// Refresh the cache if `stale` says so. One thread queries the sources at
+/// a time; others meanwhile get the cached readings (or, before the first
+/// readings exist, wait for them).
+fn ensure_fresh(stale: impl Fn(&State) -> bool) {
+    use std::sync::TryLockError;
+    let (is_stale, never) = {
+        let s = state();
+        (stale(&s), s.at.is_none())
+    };
+    if !is_stale {
+        return;
+    }
+    let mut pawn = match REFRESHING.try_lock() {
+        Ok(g) => g,
+        Err(TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(TryLockError::WouldBlock) if never => REFRESHING.lock().unwrap_or_else(|e| e.into_inner()),
+        Err(TryLockError::WouldBlock) => return,
+    };
+    if stale(&state()) {
+        refresh(&mut pawn);
+    }
+}
+
+/// Query every source and store the result. Called with [`REFRESHING`]
+/// held and the state unlocked.
+fn refresh(pawn: &mut Pawn) {
+    let now = Instant::now();
+    let (settings, generation, service_due, lhm_http_due, lhm_wmi_due) = {
+        let mut s = state();
+        if std::mem::take(&mut s.pawn_reset) {
+            *pawn = Pawn::Off;
+        }
+        (s.settings, s.generation, now >= s.service_next, now >= s.lhm_http_next, now >= s.lhm_wmi_next)
+    };
     let mut out = Vec::new();
     let mut active = Vec::new();
+    let mut service = None;
+    let mut service_retry = false;
+    let mut lhm_http_retry = false;
+    let mut lhm_wmi_retry = false;
 
     // The sensor service does the privileged reads (PawnIO) for us.
     let mut from_service = false;
-    if Instant::now() >= s.service_next {
+    if service_due {
         match super::service::fetch() {
             Ok(snap) => {
                 from_service = true;
                 active.push("Sensor service".to_string());
-                s.service = Ok(snap.status);
+                service = Some(Ok(snap.status));
                 out.extend(snap.trees.into_iter().map(|t| t.into_tree()).filter(|t| !t.hardware.is_empty()));
             }
             Err(super::service::FetchError::Absent) => {
-                s.service = Err("not installed".into());
-                s.service_next = Instant::now() + RETRY;
+                service = Some(Err("not installed".into()));
+                service_retry = true;
             }
-            Err(super::service::FetchError::Failed(e)) => s.service = Err(e),
+            Err(super::service::FetchError::Failed(e)) => service = Some(Err(e)),
         }
     }
 
-    if s.settings.pawnio && !from_service {
-        if matches!(s.pawn, Pawn::Off) {
-            s.pawn = match PawnCpu::open() {
+    if settings.pawnio && !from_service {
+        if matches!(pawn, Pawn::Off) {
+            *pawn = match PawnCpu::open() {
                 Ok(c) => {
                     log::info!("PawnIO: reading {}", c.describe());
                     Pawn::Ready(c)
@@ -167,7 +211,7 @@ fn refresh(s: &mut State) {
                 }
             };
         }
-        if let Pawn::Ready(c) = &s.pawn {
+        if let Pawn::Ready(c) = &*pawn {
             let t = c.read();
             if !t.hardware.is_empty() {
                 active.push("PawnIO".to_string());
@@ -184,29 +228,52 @@ fn refresh(s: &mut State) {
         out.push(t);
     }
 
-    let now = Instant::now();
     let mut lhm = None;
-    if !have_hwinfo && now >= s.lhm_http_next {
-        lhm = lhm_http(s.settings.lhm_port);
+    if !have_hwinfo && lhm_http_due {
+        lhm = lhm_http(settings.lhm_port);
         if let Some(t) = &lhm {
             active.push(format!("LibreHardwareMonitor web server ({} sensors)", t.sensor_count()));
         } else {
-            s.lhm_http_next = now + RETRY;
+            lhm_http_retry = true;
         }
     }
-    if !have_hwinfo && lhm.is_none() && now >= s.lhm_wmi_next {
+    if !have_hwinfo && lhm.is_none() && lhm_wmi_due {
         lhm = wmi::lhm();
         if let Some(t) = &lhm {
             active.push(format!("LibreHardwareMonitor WMI ({} sensors)", t.sensor_count()));
         } else {
-            s.lhm_wmi_next = now + RETRY * 3;
+            lhm_wmi_retry = true;
         }
     }
     out.extend(lhm);
 
+    let mut s = state();
+    if let Some(r) = service {
+        s.service = r;
+    }
+    s.pawn_line = match &*pawn {
+        Pawn::Off if settings.pawnio || s.service.is_ok() => None,
+        Pawn::Off => Some("PawnIO: off".to_string()),
+        Pawn::Ready(c) => Some(format!("PawnIO: reading {}", c.describe())),
+        Pawn::Failed(e) => Some(format!("PawnIO: {e}")),
+    };
     s.trees = out;
     s.active = active;
-    s.at = Some(Instant::now());
+    if s.generation == generation {
+        let done = Instant::now();
+        if service_retry {
+            s.service_next = done + RETRY;
+        }
+        if lhm_http_retry {
+            s.lhm_http_next = done + RETRY;
+        }
+        if lhm_wmi_retry {
+            s.lhm_wmi_next = done + RETRY * 3;
+        }
+        s.at = Some(done);
+    }
+    // Otherwise settings changed or a rescan was asked for meanwhile: leave
+    // `at` unset so the next read refreshes again.
 }
 
 // ---------------------------------------------------------------------------
@@ -588,42 +655,64 @@ use windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY;
 
 /// Every physical core's first logical processor, as an affinity.
 fn physical_cores() -> Vec<GROUP_AFFINITY> {
-    use windows_sys::Win32::System::SystemInformation::{
-        GetLogicalProcessorInformationEx, RelationProcessorCore, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
-    };
+    use windows_sys::Win32::System::SystemInformation::{GetLogicalProcessorInformationEx, RelationProcessorCore};
     let mut len = 0u32;
-    // SAFETY: first call sizes the buffer, the second fills it; records are
-    // walked within the returned length.
+    // SAFETY: the first call sizes the buffer, the second fills at most
+    // `len` bytes of it. The records are then parsed as plain bytes.
     unsafe {
         GetLogicalProcessorInformationEx(RelationProcessorCore, std::ptr::null_mut(), &mut len);
         let mut buf = vec![0u8; len as usize];
         if GetLogicalProcessorInformationEx(RelationProcessorCore, buf.as_mut_ptr().cast(), &mut len) == 0 {
             return Vec::new();
         }
-        let mut out = Vec::new();
-        let mut at = 0usize;
-        // Records are as long as their `Size` (a core's record is shorter
-        // than the whole union): walk by the 8-byte header.
-        while at + 8 <= len as usize {
-            let rec = &*(buf.as_ptr().add(at) as *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX);
-            if rec.Size == 0 || at + rec.Size as usize > len as usize {
-                break;
-            }
-            if rec.Relationship == RelationProcessorCore && rec.Anonymous.Processor.GroupCount > 0 {
-                let g = rec.Anonymous.Processor.GroupMask[0];
+        buf.truncate(len as usize);
+        core_affinities(&buf)
+    }
+}
+
+/// Parse `GetLogicalProcessorInformationEx(RelationProcessorCore)` output:
+/// each core's first logical processor. Records are variable length (a
+/// core's record is shorter than the whole Win32 union) and the buffer has
+/// no alignment guarantee, so every field is read unaligned from a slice
+/// that is bounds-checked against the record's `Size`.
+fn core_affinities(buf: &[u8]) -> Vec<GROUP_AFFINITY> {
+    use std::mem::{offset_of, size_of};
+    use windows_sys::Win32::System::SystemInformation::{
+        RelationProcessorCore, PROCESSOR_RELATIONSHIP, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+    };
+    // Header: Relationship (u32) and Size (u32).
+    const HEADER: usize = 8;
+    let payload = offset_of!(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Anonymous);
+    let count_at = payload + offset_of!(PROCESSOR_RELATIONSHIP, GroupCount);
+    let mask_at = payload + offset_of!(PROCESSOR_RELATIONSHIP, GroupMask);
+    let u32_at = |b: &[u8], at: usize| u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while buf.len().saturating_sub(at) >= HEADER {
+        let relationship = u32_at(buf, at);
+        let size = u32_at(buf, at + 4) as usize;
+        if size < HEADER || size > buf.len() - at {
+            break;
+        }
+        let rec = &buf[at..at + size];
+        if relationship == RelationProcessorCore as u32 && rec.len() >= mask_at + size_of::<GROUP_AFFINITY>() {
+            let groups = u16::from_le_bytes([rec[count_at], rec[count_at + 1]]);
+            if groups > 0 {
+                // SAFETY: the slice holds a whole GROUP_AFFINITY (checked
+                // above); read_unaligned has no alignment requirement and
+                // every bit pattern is a valid GROUP_AFFINITY.
+                let g: GROUP_AFFINITY = unsafe { std::ptr::read_unaligned(rec[mask_at..].as_ptr().cast()) };
                 if g.Mask != 0 {
                     // The core's first logical processor.
                     let first = g.Mask & g.Mask.wrapping_neg();
                     out.push(GROUP_AFFINITY { Mask: first, Group: g.Group, Reserved: [0; 3] });
                 }
             }
-            if rec.Size == 0 {
-                break;
-            }
-            at += rec.Size as usize;
         }
-        out
+        at += size;
     }
+    out
 }
 
 /// Runs the calling thread on `core` until dropped.
@@ -1466,5 +1555,57 @@ mod tests {
         for x in t.iter().filter(|x| x.source == "PawnIO") {
             eprintln!("{x:?}");
         }
+    }
+
+    /// A core record exactly as long as Windows writes it (header,
+    /// PROCESSOR_RELATIONSHIP with one GROUP_AFFINITY), not the whole union.
+    fn core_record(mask: usize, group: u16) -> Vec<u8> {
+        use std::mem::{offset_of, size_of};
+        use windows_sys::Win32::System::SystemInformation::{
+            RelationProcessorCore, PROCESSOR_RELATIONSHIP, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+        };
+        let payload = offset_of!(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Anonymous);
+        let mask_at = payload + offset_of!(PROCESSOR_RELATIONSHIP, GroupMask);
+        let size = mask_at + size_of::<GROUP_AFFINITY>();
+        let mut r = vec![0u8; size];
+        r[..4].copy_from_slice(&(RelationProcessorCore as u32).to_le_bytes());
+        r[4..8].copy_from_slice(&(size as u32).to_le_bytes());
+        let count_at = payload + offset_of!(PROCESSOR_RELATIONSHIP, GroupCount);
+        r[count_at..count_at + 2].copy_from_slice(&1u16.to_le_bytes());
+        r[mask_at..mask_at + size_of::<usize>()].copy_from_slice(&mask.to_le_bytes());
+        r[mask_at + size_of::<usize>()..mask_at + size_of::<usize>() + 2].copy_from_slice(&group.to_le_bytes());
+        assert!(size < size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>());
+        r
+    }
+
+    #[test]
+    fn core_records_parse_at_any_offset_and_length() {
+        let mut buf = core_record(0b1100, 0);
+        buf.extend(core_record(0b0011, 1));
+        let cores = core_affinities(&buf);
+        assert_eq!(cores.iter().map(|c| (c.Mask, c.Group)).collect::<Vec<_>>(), vec![(0b0100, 0), (0b0001, 1)]);
+
+        // Misaligned start: the parser only works on bytes.
+        let mut shifted = vec![0xAAu8];
+        shifted.extend(&buf);
+        assert_eq!(core_affinities(&shifted[1..]).len(), 2);
+
+        // A short final header, a truncated record, and bad sizes stop the walk.
+        let mut short = buf.clone();
+        short.extend([0u8; 5]);
+        assert_eq!(core_affinities(&short).len(), 2);
+        assert_eq!(core_affinities(&buf[..buf.len() - 1]).len(), 1);
+        let mut zero = core_record(1, 0);
+        zero[4..8].copy_from_slice(&0u32.to_le_bytes());
+        assert!(core_affinities(&zero).is_empty());
+        let mut huge = core_record(1, 0);
+        huge[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(core_affinities(&huge).is_empty());
+        assert!(core_affinities(&[]).is_empty());
+    }
+
+    #[test]
+    fn this_machine_has_cores() {
+        assert!(!physical_cores().is_empty());
     }
 }

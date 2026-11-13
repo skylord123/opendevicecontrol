@@ -30,10 +30,12 @@ const WAIT_ABANDONED: u32 = 0x80;
 const MUTEX_NAME: &str = "Global\\Access_SMBUS.HTP.Method";
 /// OpenRGB's default (`PAWNIO_SLEEPMODE_ALWAYSSLEEP`).
 const SLEEP_MODE_ALWAYS_SLEEP: u64 = 2;
+const LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR: u32 = 0x100;
+const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x800;
 
 #[link(name = "kernel32")]
 extern "system" {
-    fn LoadLibraryW(name: *const u16) -> *mut c_void;
+    fn LoadLibraryExW(name: *const u16, file: HANDLE, flags: u32) -> *mut c_void;
     fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
     fn CreateMutexW(attrs: *mut c_void, initial_owner: i32, name: *const u16) -> HANDLE;
     fn WaitForSingleObject(handle: HANDLE, ms: u32) -> u32;
@@ -59,22 +61,53 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// The 64-bit Program Files folder, from the machine's registry rather than
+/// the `ProgramFiles` environment variable, which a user can override for
+/// processes they start (elevated ones included). The sensor service and
+/// its installer run as SYSTEM or administrator, so where they load and
+/// install code from must not be up to the user.
+pub fn program_files() -> PathBuf {
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
+    let key = wide(r"SOFTWARE\Microsoft\Windows\CurrentVersion");
+    let value = wide("ProgramFilesDir");
+    let mut buf = [0u16; 512];
+    let mut bytes = std::mem::size_of_val(&buf) as u32;
+    // SAFETY: plain Win32 call; `bytes` is the buffer's size and the value
+    // is written NUL-terminated within it.
+    let r = unsafe {
+        RegGetValueW(HKEY_LOCAL_MACHINE, key.as_ptr(), value.as_ptr(), RRF_RT_REG_SZ, std::ptr::null_mut(), buf.as_mut_ptr().cast(), &mut bytes)
+    };
+    let n = buf.iter().position(|&c| c == 0).unwrap_or(0);
+    if r == 0 && n > 0 {
+        PathBuf::from(String::from_utf16_lossy(&buf[..n]))
+    } else {
+        PathBuf::from(r"C:\Program Files")
+    }
+}
+
+/// Where the PawnIO installer puts its library.
+pub fn lib_path() -> PathBuf {
+    program_files().join("PawnIO").join("PawnIOLib.dll")
+}
+
 fn lib() -> std::result::Result<&'static Lib, String> {
     static LIB: OnceLock<std::result::Result<Lib, String>> = OnceLock::new();
     LIB.get_or_init(|| {
-        let mut candidates = Vec::new();
-        if let Some(pf) = std::env::var_os("ProgramFiles") {
-            candidates.push(PathBuf::from(pf).join("PawnIO").join("PawnIOLib.dll"));
-        }
-        candidates.push(PathBuf::from("PawnIOLib.dll"));
+        // Only PawnIO's own install folder: never a bare name, which the
+        // loader would also look for in the current directory and PATH. Its
+        // dependencies come from its folder and System32.
+        let path = lib_path();
         // SAFETY: plain Win32 calls; the module is never unloaded, so the
         // function pointers stay valid for the life of the process.
         unsafe {
-            let module = candidates
-                .iter()
-                .map(|p| LoadLibraryW(wide(&p.to_string_lossy()).as_ptr()))
-                .find(|m| !m.is_null())
-                .ok_or_else(|| "PawnIO is not installed (PawnIOLib.dll not found). Install it from https://pawnio.eu".to_string())?;
+            let module = LoadLibraryExW(
+                wide(&path.to_string_lossy()).as_ptr(),
+                std::ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
+            );
+            if module.is_null() {
+                return Err(format!("PawnIO is not installed ({} not found). Install it from https://pawnio.eu", path.display()));
+            }
             let sym = |name: &str| {
                 let n: Vec<u8> = name.bytes().chain(std::iter::once(0)).collect();
                 let p = GetProcAddress(module, n.as_ptr());
@@ -381,4 +414,15 @@ pub fn open_dram_buses() -> Result<Vec<Box<dyn SmBus>>> {
         return Err(Error::Bus(problems.join("; ")));
     }
     Ok(buses)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn program_files_comes_from_the_registry() {
+        let pf = super::program_files();
+        assert!(pf.is_absolute(), "{}", pf.display());
+        assert!(pf.is_dir(), "{}", pf.display());
+        assert!(super::lib_path().starts_with(&pf));
+    }
 }

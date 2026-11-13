@@ -10,4 +10,4 @@ opendevicecontrol-sensors: OpenDeviceControl's hardware sensor service (Windows)
 The service runs as LocalSystem and reads the CPU's sensors through the
 PawnIO driver, which only administrators may open. OpenDeviceControl reads the results
 over the local, read-only pipe \\.\pipe\opendevicecontrol-sensors.
-Log: %ProgramData%\OpenDeviceControl\sensors.log
+Log: %ProgramFiles%\OpenDeviceControl\Sensors\sensors.log
