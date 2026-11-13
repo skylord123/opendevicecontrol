@@ -87,24 +87,61 @@ Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags
 [UninstallRun]
 ; Remove the sensor service (PawnIO stays: other tools may use it).
 Filename: "{app}\opendevicecontrol-sensors.exe"; Parameters: "--uninstall"; Verb: "runas"; Flags: shellexec runhidden waituntilterminated; Check: SensorServiceInstalled; RunOnceId: "RemoveSensorService"
-; Quit cleanly so the PSU fan is handed back to hardware control.
-Filename: "{app}\opendevicecontrol-cli.exe"; Parameters: "--quit"; Flags: runhidden waituntilterminated; RunOnceId: "QuitOpenDeviceControl"
+; A running opendevicecontrol is asked to quit in InitializeUninstall (below).
 
 [UninstallDelete]
 Type: files; Name: "{app}\*.log"
 
 [Code]
-// Ask a running opendevicecontrol (from a previous install) to exit cleanly before
-// its files are replaced. Fails silently when none is running.
-function PrepareToInstall(var NeedsRestart: Boolean): String;
+// Exit codes of "opendevicecontrol-cli --quit" (versions before these codes
+// return 0 when one was running, 1 when none was).
+const
+  QuitStopped = 0;
+  QuitNotRunning = 1;
+  QuitTimedOut = 2;
+  QuitFailed = 3;
+
+// Ask a running opendevicecontrol to exit cleanly (it hands the PSU fan back
+// to hardware control). Returns an error message when it is still running,
+// or '' when it stopped or none was running.
+function QuitRunning: String;
 var
   Cli: String;
   Code: Integer;
 begin
-  Cli := ExpandConstant('{app}\opendevicecontrol-cli.exe');
-  if FileExists(Cli) then
-    Exec(Cli, '--quit', '', SW_HIDE, ewWaitUntilTerminated, Code);
   Result := '';
+  Cli := ExpandConstant('{app}\opendevicecontrol-cli.exe');
+  if not FileExists(Cli) then
+    exit;
+  if not Exec(Cli, '--quit', '', SW_HIDE, ewWaitUntilTerminated, Code) then begin
+    Log('Could not run ' + Cli + ' --quit: ' + SysErrorMessage(Code));
+    exit;
+  end;
+  case Code of
+    QuitStopped: Log('OpenDeviceControl exited cleanly.');
+    QuitNotRunning: Log('OpenDeviceControl was not running.');
+    QuitFailed: Log('OpenDeviceControl exited, but could not hand every device back to hardware control (see its log).');
+    QuitTimedOut: Result := 'OpenDeviceControl did not exit in time. Quit it from its tray icon, then try again.';
+  else
+    Log(Format('opendevicecontrol-cli --quit returned %d.', [Code]));
+  end;
+end;
+
+// Before files from a previous install are replaced.
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := QuitRunning;
+end;
+
+// Before anything is removed.
+function InitializeUninstall: Boolean;
+var
+  Error: String;
+begin
+  Error := QuitRunning;
+  Result := Error = '';
+  if not Result then
+    SuppressibleMsgBox(Error, mbError, MB_OK, IDOK);
 end;
 
 function SensorServiceInstalled: Boolean;
@@ -113,7 +150,13 @@ begin
 end;
 
 // "Add to PATH": the user's PATH for a per-user install, the system PATH
-// for an all-users install. Removed again on uninstall.
+// for an all-users install. Removed again on uninstall, but only when setup
+// added it (recorded under SetupKey): an entry that was already there, or a
+// skipped task, leaves PATH alone.
+
+const
+  SetupKey = 'Software\OpenDeviceControl\Setup';
+  PathOwnedValue = 'AddedToPath';
 
 function PathRoot: Integer;
 begin
@@ -142,11 +185,14 @@ var
 begin
   if not RegQueryStringValue(PathRoot, PathKey, 'Path', Paths) then
     Paths := '';
+  // Already there: added by an earlier install (still recorded) or by the
+  // user (not ours to remove).
   if PathHas(Paths, Dir) then
     exit;
   if (Paths <> '') and (Copy(Paths, Length(Paths), 1) <> ';') then
     Paths := Paths + ';';
-  RegWriteExpandStringValue(PathRoot, PathKey, 'Path', Paths + Dir);
+  if RegWriteExpandStringValue(PathRoot, PathKey, 'Path', Paths + Dir) then
+    RegWriteStringValue(PathRoot, SetupKey, PathOwnedValue, Dir);
 end;
 
 procedure RemoveFromPath(Dir: String);
@@ -172,7 +218,16 @@ begin
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  Owned: String;
 begin
-  if CurUninstallStep = usPostUninstall then
-    RemoveFromPath(ExpandConstant('{app}'));
+  if CurUninstallStep = usPostUninstall then begin
+    if RegQueryStringValue(PathRoot, SetupKey, PathOwnedValue, Owned) then begin
+      if CompareText(Owned, ExpandConstant('{app}')) = 0 then
+        RemoveFromPath(Owned);
+      RegDeleteValue(PathRoot, SetupKey, PathOwnedValue);
+      RegDeleteKeyIfEmpty(PathRoot, SetupKey);
+      RegDeleteKeyIfEmpty(PathRoot, 'Software\OpenDeviceControl');
+    end;
+  end;
 end;

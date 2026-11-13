@@ -62,7 +62,10 @@ opendevicecontrol [--minimized] [--headless] [--probe] [--quit] [-v] [--help] [-
 ```
 
 On Windows use `opendevicecontrol-cli` from a terminal. `--probe` prints one
-reading of every device, handy for checking permissions and support.
+reading of every device, handy for checking permissions and support. It
+refuses to run while OpenDeviceControl is running, since that copy owns the
+devices. `--quit` asks a running copy to exit and hand its devices back to
+hardware control; `--help` lists its exit codes.
 
 Config lives in `%APPDATA%\opendevicecontrol\` or `~/.config/opendevicecontrol/`;
 state and logs in `%LOCALAPPDATA%\opendevicecontrol\` or

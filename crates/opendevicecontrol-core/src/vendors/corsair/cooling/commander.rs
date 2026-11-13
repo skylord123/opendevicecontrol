@@ -348,10 +348,8 @@ impl Device for Commander {
         self.io.write_colors(&rgb_bytes(colors, total))
     }
 
-    fn release(&mut self) {
-        if let Err(e) = self.io.transfer(endpoint::HARDWARE_MODE, &[]) {
-            log::warn!("{}: could not return to hardware mode: {e}", self.model.name);
-        }
+    fn release(&mut self) -> Result<()> {
+        self.io.transfer(endpoint::HARDWARE_MODE, &[]).map(drop)
     }
 }
 

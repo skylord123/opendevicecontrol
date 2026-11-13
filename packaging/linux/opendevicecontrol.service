@@ -1,6 +1,8 @@
 # Optional: run opendevicecontrol WITHOUT the GUI as a systemd user service
 # (e.g. a headless machine). Do not combine with GUI autostart — only one
-# instance can own the devices.
+# instance can own the devices. This copy is for install.sh (the .tar.gz),
+# which installs the program to ~/.local/bin. The .deb and .rpm packages
+# ship packaged/opendevicecontrol.service, for /usr/bin.
 #
 #   cp opendevicecontrol.service ~/.config/systemd/user/
 #   systemctl --user daemon-reload

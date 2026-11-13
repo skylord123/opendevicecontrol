@@ -517,10 +517,11 @@ impl Device for VoidHeadset {
         Ok(())
     }
 
-    fn release(&mut self) {
+    fn release(&mut self) -> Result<()> {
         if self.owner_requested.take().is_some() {
-            let _ = self.write(&lighting_owner_packet(false));
+            return self.write(&lighting_owner_packet(false));
         }
+        Ok(())
     }
 }
 

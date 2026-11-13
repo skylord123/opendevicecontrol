@@ -31,6 +31,8 @@ fn main() {
         for k in d.input_keys() {
             println!("  input key {} ({})", k.id, k.name);
         }
-        d.release();
+        if let Err(e) = d.release() {
+            println!("  release error: {e}");
+        }
     }
 }

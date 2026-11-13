@@ -594,17 +594,17 @@ impl Device for BragiDevice {
         events
     }
 
-    fn release(&mut self) {
-        if let Err(e) = self.write_assignment(true) {
+    fn release(&mut self) -> Result<()> {
+        let restored = self.write_assignment(true);
+        if let Err(e) = &restored {
             log::warn!("{}: restoring key assignment: {e}", self.info.id);
         }
         if self.has_key_locks() && self.win_lock {
             let _ = self.set(proto::PROP_KEY_LOCKS, 0);
         }
         self.close_handle(proto::HANDLE_LIGHTING);
-        if let Err(e) = self.set(proto::PROP_MODE, proto::MODE_HARDWARE) {
-            log::warn!("{}: back to hardware mode: {e}", self.info.id);
-        }
+        // Hardware mode matters most, so its error wins.
+        self.set(proto::PROP_MODE, proto::MODE_HARDWARE).and(restored)
     }
 }
 

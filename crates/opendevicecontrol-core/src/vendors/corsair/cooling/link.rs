@@ -365,10 +365,8 @@ impl Device for LinkHub {
         self.io.write_colors(&rgb_bytes(colors, total))
     }
 
-    fn release(&mut self) {
-        if let Err(e) = self.io.transfer(endpoint::HARDWARE_MODE, &[]) {
-            log::warn!("LINK hub: could not return to hardware mode: {e}");
-        }
+    fn release(&mut self) -> Result<()> {
+        self.io.transfer(endpoint::HARDWARE_MODE, &[]).map(drop)
     }
 }
 

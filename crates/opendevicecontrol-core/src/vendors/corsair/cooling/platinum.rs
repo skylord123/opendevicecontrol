@@ -340,13 +340,11 @@ impl Device for HydroPlatinum {
         Ok(())
     }
 
-    fn release(&mut self) {
+    fn release(&mut self) -> Result<()> {
         for f in self.fans.iter_mut() {
             *f = FanSetting::Profile(default_profile());
         }
-        if let Err(e) = self.apply_cooling() {
-            log::warn!("{}: could not restore the default fan profile: {e}", self.model.name);
-        }
+        self.apply_cooling().map(drop)
     }
 }
 
