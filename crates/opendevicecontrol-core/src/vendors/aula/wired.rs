@@ -40,9 +40,10 @@ const FRAME_SLACK: Duration = Duration::from_millis(15);
 /// While keys were pressed this recently, hold lighting frames back: each
 /// one stalls the keyboard's key handling for about 67 ms.
 const TYPING_HOLD: Duration = Duration::from_millis(400);
-/// But send one at least this often, or the keyboard leaves live mode
-/// (about 2 s without a frame) and flashes its built-in effect.
-const TYPING_KEEPALIVE: Duration = Duration::from_millis(1500);
+/// But still send one this often while typing: the lights keep reacting,
+/// and about one key in eight lands in a frame and waits up to 67 ms.
+/// (Under 2 s also keeps the keyboard in live mode.)
+const TYPING_KEEPALIVE: Duration = Duration::from_millis(500);
 
 /// Send a read request and fetch its answer.
 fn read(dev: &hidapi::HidDevice, request: &[u8]) -> Result<Vec<u8>> {
