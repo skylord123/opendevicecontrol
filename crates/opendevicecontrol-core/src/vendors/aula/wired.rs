@@ -16,10 +16,20 @@ pub struct Wired {
     next_battery_check: Instant,
     settings_changed: bool,
     host: Vec<Option<u16>>,
+    /// When the last lighting frame was started.
+    last_show: Option<Instant>,
 }
 
 /// How often to read the battery level.
 const BATTERY_CHECK: Duration = Duration::from_secs(30);
+/// While lighting frames stream, the battery read (which waits behind a
+/// 67 ms frame and stalls the next one) is put off, up to this long.
+const BATTERY_DEFER: Duration = Duration::from_secs(300);
+/// Least time between lighting frames. The keyboard takes 67 ms to accept
+/// a frame but longer to apply it, and queues what it hasn't applied yet:
+/// frames sent back to back pile up into seconds of lag and delay key
+/// presses. The official driver starts one about every 95 ms.
+const FRAME_GAP: Duration = Duration::from_millis(100);
 
 /// Send a read request and fetch its answer.
 fn read(dev: &hidapi::HidDevice, request: &[u8]) -> Result<Vec<u8>> {
@@ -37,7 +47,7 @@ impl Wired {
         if let Some(e) = &events {
             let _ = e.set_blocking_mode(false);
         }
-        Self { dev, events, battery: None, next_battery_check: Instant::now(), settings_changed: false, host: Vec::new() }
+        Self { dev, events, battery: None, next_battery_check: Instant::now(), settings_changed: false, host: Vec::new(), last_show: None }
     }
 
     /// Read input report 3 (`03 type a b`): host keys and change notices.
@@ -78,7 +88,9 @@ impl Wired {
 impl Link for Wired {
     fn poll(&mut self) -> Result<()> {
         self.read_events();
-        if Instant::now() >= self.next_battery_check {
+        let streaming = self.last_show.is_some_and(|t| t.elapsed() < Duration::from_secs(1));
+        let overdue = Instant::now() >= self.next_battery_check + BATTERY_DEFER;
+        if Instant::now() >= self.next_battery_check && (self.battery.is_none() || !streaming || overdue) {
             self.next_battery_check = Instant::now() + BATTERY_CHECK;
             match read(&self.dev, &wired::battery_request()) {
                 Ok(r) => self.battery = wired::parse_battery(&r),
@@ -147,6 +159,10 @@ impl Link for Wired {
     }
 
     fn show(&mut self, leds: &[(u8, Rgb)], _uniform: Option<Rgb>) -> Result<bool> {
+        if self.last_show.is_some_and(|t| t.elapsed() < FRAME_GAP) {
+            return Ok(false);
+        }
+        self.last_show = Some(Instant::now());
         self.dev.send_feature_report(&wired::lights(leds))?;
         Ok(true)
     }

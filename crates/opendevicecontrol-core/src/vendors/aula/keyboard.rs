@@ -248,6 +248,8 @@ pub struct AulaKeyboard {
     frame: Vec<(u8, Rgb)>,
     uniform: Option<Rgb>,
     last_sent: Option<Instant>,
+    /// The link skipped the current frame (too soon after the last one).
+    pending: bool,
     /// Built-in effect preview while OpenDeviceControl lighting is off.
     preview: Option<super::preview::Preview>,
     /// Host key currently held (cable only).
@@ -274,6 +276,7 @@ impl AulaKeyboard {
             frame: Vec::new(),
             uniform: None,
             last_sent: None,
+            pending: false,
             preview: None,
             host_key_down: None,
             released_by_switch: None,
@@ -325,6 +328,13 @@ impl AulaKeyboard {
             return Ok(());
         }
         self.next_link_check = Instant::now() + LINK_CHECK;
+        // While lighting frames stream over the cable, a pulled cable shows
+        // up as a send error within a second. Enumerating would also read
+        // the keyboard's USB strings, which queue behind each 67 ms frame
+        // and freeze the lights for about 150 ms, so skip it then.
+        if self.wired && self.last_sent.is_some_and(|t| t.elapsed() < REFRESH * 2) {
+            return Ok(());
+        }
         let Some(api) = self.api() else { return Ok(()) };
         let cables: Vec<_> = super::present(api, true).into_iter().filter(|p| !self.not_ours.contains(p)).collect();
         if self.wired {
@@ -375,9 +385,11 @@ impl AulaKeyboard {
     }
 
     fn send_frame(&mut self) -> Result<()> {
-        if self.link.show(&self.frame, self.uniform)? {
+        let sent = self.link.show(&self.frame, self.uniform)?;
+        if sent {
             self.last_sent = Some(Instant::now());
         }
+        self.pending = !sent;
         Ok(())
     }
 
@@ -514,7 +526,7 @@ impl Device for AulaKeyboard {
             self.read_config();
         }
         // Keep software lighting alive between effect frames.
-        if self.software && !self.frame.is_empty() && self.last_sent.is_none_or(|t| t.elapsed() >= REFRESH) {
+        if self.software && !self.frame.is_empty() && (self.pending || self.last_sent.is_none_or(|t| t.elapsed() >= REFRESH)) {
             self.send_frame()?;
         }
         let mut sensors = Vec::new();
@@ -758,7 +770,7 @@ impl Device for AulaKeyboard {
         };
         let uniform = if self.model.layout.is_some() { uniform } else { Some(first) };
         let fresh = self.last_sent.is_some_and(|t| t.elapsed() < REFRESH);
-        if frame == self.frame && fresh {
+        if frame == self.frame && fresh && !self.pending {
             return Ok(());
         }
         self.frame = frame;

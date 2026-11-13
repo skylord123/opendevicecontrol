@@ -147,13 +147,10 @@ custom colours and a sensitivity. OpenDeviceControl listens to the default
 output device (WASAPI loopback on Windows, the PulseAudio/PipeWire monitor on
 Linux), records nothing, and only captures while a sound effect is shown.
 
-On the Aula F99, sound effects look smoother over the 2.4 GHz receiver than
-over the USB cable. Over the cable the keyboard takes about 67 ms to accept
-each lighting frame, whatever is in it, so it tops out around 15 frames a
-second. The receiver sends a one-colour frame in about 10 ms, which is what
-most beat effects show. That limit is in the keyboard's firmware, not the
-USB connection, and the receiver can't reach the keyboard while the cable is
-plugged in.
+On the Aula F99's USB cable, live lighting runs at about 10 frames a second,
+the same rate as the official driver. The keyboard takes 67 ms to accept
+each frame and a little longer to show it, and it queues frames it hasn't
+shown yet, so sending faster builds up lag and delays key presses.
 
 ## Corsair RGB memory (experimental, off by default)
 
