@@ -646,10 +646,23 @@ impl Device for AulaKeyboard {
 
     fn write_macros(&mut self, macros: &[Macro]) -> Result<()> {
         let area = keys::macro_area(macros).map_err(Error::Bus)?;
+        let pages = area.len().div_ceil(keys::SECTOR);
         for (page, chunk) in area.chunks(keys::SECTOR).enumerate() {
-            self.link.write_sector(Sector::Macros(page as u8), chunk)?;
+            if let Err(e) = self.link.write_sector(Sector::Macros(page as u8), chunk) {
+                return Err(if page == 0 {
+                    e
+                } else {
+                    Error::Bus(format!("macro page {} of {pages} failed ({e}); the keyboard's macros may be partly updated", page + 1))
+                });
+            }
             // The official driver leaves 100 ms between pages.
             std::thread::sleep(Duration::from_millis(100));
+        }
+        // Readback, compared as the keyboard stores it (names trimmed,
+        // empty slots blank), so a silently dropped page is an error.
+        let back = self.read_macros()?;
+        if back != keys::macros_from_area(&area) {
+            return Err(Error::Bus("the keyboard reads back different macros than were written".into()));
         }
         Ok(())
     }

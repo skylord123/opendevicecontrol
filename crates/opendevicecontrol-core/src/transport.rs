@@ -43,6 +43,13 @@ impl HidTransport {
     /// request. Mismatching replies are skipped; the request is retried a
     /// few times before giving up.
     pub fn transact(&self, payload: &[u8], echo: usize) -> Result<[u8; REPORT_LEN]> {
+        self.transact_min(payload, echo, echo)
+    }
+
+    /// Like [`HidTransport::transact`], but a reply also has to be at least
+    /// `need` bytes long (what the caller will decode); shorter ones are
+    /// skipped instead of being read as zero padding.
+    pub fn transact_min(&self, payload: &[u8], echo: usize, need: usize) -> Result<[u8; REPORT_LEN]> {
         let cmd = payload.get(1).copied().unwrap_or(0);
         let mut saw_reply = false;
         for _ in 0..self.retries {
@@ -60,10 +67,10 @@ impl HidTransport {
                     break;
                 }
                 saw_reply = true;
-                if buf[..echo] == payload[..echo] {
+                if accept(payload, echo, need, &buf, n) {
                     return Ok(buf);
                 }
-                log::trace!("skipping foreign reply {:02x?}", &buf[..4]);
+                log::trace!("skipping foreign or short reply ({n} bytes) {:02x?}", &buf[..4]);
             }
         }
         if saw_reply {
@@ -71,5 +78,32 @@ impl HidTransport {
         } else {
             Err(Error::NoReply { cmd })
         }
+    }
+}
+
+/// Whether a reply of `n` bytes in `buf` answers `payload`: it echoes the
+/// first `echo` bytes and is at least `need` bytes long.
+fn accept(payload: &[u8], echo: usize, need: usize, buf: &[u8], n: usize) -> bool {
+    let n = n.min(buf.len());
+    n >= echo.max(need) && echo <= payload.len() && buf[..echo] == payload[..echo]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::accept;
+
+    #[test]
+    fn short_or_foreign_replies_are_skipped() {
+        let mut buf = [0u8; 64];
+        buf[..4].copy_from_slice(&[0x03, 0x8b, 0x12, 0x34]);
+        assert!(accept(&[0x03, 0x8b], 2, 4, &buf, 64));
+        assert!(accept(&[0x03, 0x8b], 2, 4, &buf, 4));
+        // Truncated: the data bytes we would decode were never received.
+        assert!(!accept(&[0x03, 0x8b], 2, 4, &buf, 3));
+        // Truncated inside the echo: zero padding must not match a zero header.
+        let zeros = [0u8; 64];
+        assert!(!accept(&[0x00, 0x00], 2, 2, &zeros, 1));
+        // Reply to another register.
+        assert!(!accept(&[0x03, 0x8c], 2, 4, &buf, 64));
     }
 }

@@ -6,7 +6,7 @@ pub use crate::vendors::corsair::{bragi, cooling, hxi, nxp, ram, void};
 
 use crate::model::*;
 use crate::Result;
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ffi::CString;
 
 /// Control id (a toggle) that switches between OpenDeviceControl's lighting and the
@@ -141,23 +141,41 @@ pub trait Device: Send {
 }
 
 /// Assigns stable ids: the model slug, suffixed `-2`, `-3`… for duplicates.
+///
+/// Ids already held by running workers are reserved and never handed out
+/// again, so a new device can't take the id of one that is still open
+/// (whatever order the scan sees them in). Drivers allocate only for devices
+/// they are about to open, not for held ones.
 #[derive(Default)]
-pub(crate) struct Ids(HashMap<&'static str, usize>);
+pub(crate) struct Ids {
+    reserved: HashSet<String>,
+    given: HashSet<String>,
+}
 
 impl Ids {
+    pub(crate) fn reserving<I: IntoIterator<Item = String>>(held: I) -> Self {
+        Ids { reserved: held.into_iter().collect(), given: HashSet::new() }
+    }
+
     pub(crate) fn next(&mut self, slug: &'static str) -> String {
-        let n = self.0.entry(slug).or_default();
-        *n += 1;
-        if *n == 1 { slug.to_string() } else { format!("{slug}-{n}") }
+        let id = (1..)
+            .map(|n: usize| if n == 1 { slug.to_string() } else { format!("{slug}-{n}") })
+            .find(|id| !self.reserved.contains(id) && !self.given.contains(id))
+            .expect("unbounded");
+        self.given.insert(id.clone());
+        id
     }
 }
 
 /// Enumerate and open every supported device, from every vendor.
 ///
-/// Returns each device with the HID path that identifies it (its primary
-/// interface). Devices whose primary path is in `skip_paths` are already
-/// held by the caller and are not reopened; failures are logged and skipped.
-pub fn discover(skip_paths: &[CString]) -> Result<Vec<(CString, Box<dyn Device>)>> {
+/// `held` lists the devices the caller already runs, as (primary path, id):
+/// those paths are not reopened and their ids are not reused. Returns each
+/// new device with the HID path that identifies it (its primary interface);
+/// failures are logged and skipped.
+pub fn discover(held: &[(CString, String)]) -> Result<Vec<(CString, Box<dyn Device>)>> {
+    let skip_paths: Vec<CString> = held.iter().map(|(p, _)| p.clone()).collect();
+    let skip_paths = skip_paths.as_slice();
     let api = hidapi::HidApi::new()?;
     let mut list: Vec<&hidapi::DeviceInfo> = api.device_list().collect();
     // Stable order so duplicate ids are assigned consistently.
@@ -165,7 +183,7 @@ pub fn discover(skip_paths: &[CString]) -> Result<Vec<(CString, Box<dyn Device>)
     let mut seen = std::collections::HashSet::new();
     list.retain(|d| seen.insert(d.path().to_owned()));
 
-    let mut ids = Ids::default();
+    let mut ids = Ids::reserving(held.iter().map(|(_, id)| id.clone()));
     let mut out: Vec<(CString, Box<dyn Device>)> = Vec::new();
     crate::vendors::corsair::discover(&api, &list, &mut ids, skip_paths, &mut out);
     crate::vendors::aula::discover(&api, &list, &mut ids, skip_paths, &mut out);
@@ -179,4 +197,33 @@ pub fn discover(skip_paths: &[CString]) -> Result<Vec<(CString, Box<dyn Device>)
         out.push((this_pc, Box::new(crate::system::ThisPc::open())));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod ids_tests {
+    use super::Ids;
+
+    #[test]
+    fn first_scan_numbers_from_the_bare_slug() {
+        let mut ids = Ids::default();
+        assert_eq!(ids.next("k70"), "k70");
+        assert_eq!(ids.next("k70"), "k70-2");
+        assert_eq!(ids.next("hx1000i"), "hx1000i");
+    }
+
+    #[test]
+    fn new_device_never_takes_a_held_id() {
+        // A running "k70" is held; a second unit sorts before it on rescan.
+        let mut ids = Ids::reserving(["k70".to_string()]);
+        assert_eq!(ids.next("k70"), "k70-2");
+    }
+
+    #[test]
+    fn replugged_first_unit_gets_its_id_back() {
+        // Two units ran as "k70" and "k70-2"; the first was unplugged and
+        // comes back while "k70-2" is still held.
+        let mut ids = Ids::reserving(["k70-2".to_string()]);
+        assert_eq!(ids.next("k70"), "k70");
+        assert_eq!(ids.next("k70"), "k70-3");
+    }
 }

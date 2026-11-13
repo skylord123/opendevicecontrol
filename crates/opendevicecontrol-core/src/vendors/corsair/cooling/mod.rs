@@ -145,10 +145,10 @@ pub(super) fn discover(api: &hidapi::HidApi, list: &[&hidapi::DeviceInfo], skip:
             } else {
                 continue;
             };
-            let id = ids.next(slug);
             if skip.iter().any(|p| p.as_c_str() == d.path()) {
                 continue;
             }
+            let id = ids.next(slug);
             let dev = match api.open_path(d.path()) {
                 Ok(h) => h,
                 Err(e) => {
