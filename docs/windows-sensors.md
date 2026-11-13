@@ -45,11 +45,25 @@ running as LocalSystem:
   (only administrators can change that folder, which matters for a program
   running as LocalSystem), runs the bundled `PawnIO_setup.exe -install
   -silent` when PawnIO is missing, and registers and starts the service
-  `OpenDeviceControlSensors` (automatic start).
+  `OpenDeviceControlSensors` (automatic start). Nothing the service runs is
+  used from OpenDeviceControl's own folder, which a per-user install lets
+  the user change: the PawnIO installer is copied under `%ProgramFiles%` and
+  checked against its pinned SHA-256 before it runs, `%ProgramFiles%` comes
+  from the machine's registry rather than the environment, and
+  `PawnIOLib.dll` is only loaded from PawnIO's own folder.
+* An update is copied next to the installed one first
+  (`Sensors.new`). Only then is the running service stopped (it has to
+  really stop), the folders swapped (the old one kept as `Sensors.old`),
+  and the new version started. It counts as installed once the service is
+  running and answers on its pipe as the new version; otherwise the
+  previous version is put back and started again.
 * The service reads the sensors through PawnIO and serves them on the local
   pipe `\\.\pipe\opendevicecontrol-sensors`: a client connects, gets one JSON
   snapshot, and the pipe closes. It takes no commands. Signed-in users may
-  read it; remote clients are rejected.
+  read it; remote clients are rejected. A client gets 3 s to take its
+  snapshot and a reader waits at most 3 s for one, so neither side can hold
+  the other up; OpenDeviceControl reads it without holding its sensor cache,
+  so a slow source never blocks This PC or device commands.
 * OpenDeviceControl reads the pipe on every poll (looking for the service again every
   20 s when it isn't there) and uses it before everything else; with the
   service running, the in-process PawnIO option isn't needed.
@@ -57,7 +71,7 @@ running as LocalSystem:
   `--uninstall` (elevated; the uninstaller runs it) removes the service and
   its folder. PawnIO stays installed, since other tools may use it; it has
   its own uninstaller.
-* Log: `%ProgramData%\OpenDeviceControl\sensors.log`.
+* Log: `%ProgramFiles%\OpenDeviceControl\Sensors\sensors.log`.
 
 #### Motherboard chip (Super I/O)
 

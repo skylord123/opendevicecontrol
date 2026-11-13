@@ -118,12 +118,15 @@ impl WinGpus {
             if r != PDH_MORE_DATA || size == 0 {
                 return out;
             }
-            let mut buf = vec![0u8; size as usize];
+            // u64 storage: the items hold f64s and pointers, so the buffer
+            // must be 8-byte aligned (a Vec<u8> only promises 1).
+            let mut buf = vec![0u64; (size as usize).div_ceil(8)];
             let items = buf.as_mut_ptr() as *mut PDH_FMT_COUNTERVALUE_ITEM_W;
             if PdhGetFormattedCounterArrayW(counter as _, PDH_FMT_DOUBLE, &mut size, &mut count, items) != 0 {
                 return out;
             }
-            for i in 0..count as usize {
+            let fits = buf.len() * 8 / std::mem::size_of::<PDH_FMT_COUNTERVALUE_ITEM_W>();
+            for i in 0..(count as usize).min(fits) {
                 let it = &*items.add(i);
                 if it.FmtValue.CStatus != 0 {
                     continue;

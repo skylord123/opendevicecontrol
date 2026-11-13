@@ -39,7 +39,7 @@ pub fn run_elevated(arg: &str) -> String {
         match (arg, code) {
             ("--install", 0) => "Sensor service installed and running.".into(),
             ("--uninstall", 0) => "Sensor service removed.".into(),
-            (_, c) => format!("opendevicecontrol-sensors {arg} failed (exit code {c}); see %ProgramData%\\OpenDeviceControl\\sensors.log or run it from an elevated prompt."),
+            (_, c) => format!("opendevicecontrol-sensors {arg} failed (exit code {c}); see %ProgramFiles%\\OpenDeviceControl\\Sensors\\sensors.log or run it from an elevated prompt."),
         }
     }
 }

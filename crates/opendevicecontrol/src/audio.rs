@@ -103,11 +103,11 @@ impl Audio {
         drop(s);
         if !self.0.running.swap(true, Ordering::SeqCst) {
             let me = self.clone();
-            std::thread::Builder::new()
-                .name("audio".into())
-                .spawn(move || me.run())
-                .map_err(|e| log::warn!("audio thread: {e}"))
-                .ok();
+            if let Err(e) = std::thread::Builder::new().name("audio".into()).spawn(move || me.run()) {
+                log::warn!("audio thread: {e}");
+                // Let the next read try again.
+                self.0.running.store(false, Ordering::SeqCst);
+            }
         }
         f
     }
@@ -304,6 +304,40 @@ fn fft(re: &mut [f32], im: &mut [f32]) {
     }
 }
 
+/// WASAPI loopback delivers no packets at all while nothing plays. This
+/// turns such a gap into the silence it stands for, so the analysis (and
+/// the lights) fade out instead of holding the last spectrum.
+#[cfg_attr(not(windows), allow(dead_code))]
+struct GapFiller {
+    last: Instant,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl GapFiller {
+    /// Gaps shorter than this are normal jitter between polls.
+    const MIN_GAP: Duration = Duration::from_millis(30);
+    /// At most this much silence is added at once (after a stall).
+    const MAX_GAP: Duration = Duration::from_secs(1);
+
+    fn new(now: Instant) -> Self {
+        Self { last: now }
+    }
+
+    /// Call once per poll with the samples it produced (mono, `rate` Hz).
+    fn fill(&mut self, mono: &mut Vec<f32>, rate: u32, now: Instant) {
+        if !mono.is_empty() {
+            self.last = now;
+            return;
+        }
+        let gap = now.saturating_duration_since(self.last);
+        if gap >= Self::MIN_GAP {
+            let n = (gap.min(Self::MAX_GAP).as_secs_f64() * rate as f64) as usize;
+            mono.resize(n, 0.0);
+            self.last = now;
+        }
+    }
+}
+
 /// Average interleaved channels into mono.
 fn to_mono(interleaved: &[f32], channels: usize, out: &mut Vec<f32>) {
     out.clear();
@@ -332,6 +366,7 @@ mod capture {
         client.start_stream().map_err(e)?;
         let mut bytes = VecDeque::new();
         let (mut floats, mut mono) = (Vec::new(), Vec::new());
+        let mut gaps = super::GapFiller::new(std::time::Instant::now());
         loop {
             std::thread::sleep(std::time::Duration::from_millis(10));
             while capture.get_next_packet_size().map_err(e)?.unwrap_or(0) > 0 {
@@ -342,6 +377,7 @@ mod capture {
             let raw: Vec<u8> = bytes.drain(..whole).collect();
             floats.extend(raw.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)));
             super::to_mono(&floats, CHANNELS, &mut mono);
+            gaps.fill(&mut mono, RATE, std::time::Instant::now());
             if !sink(&mono, RATE) {
                 let _ = client.stop_stream();
                 return Ok(());
@@ -456,6 +492,40 @@ mod tests {
             }
         }
         assert!((6..=9).contains(&beats), "{beats} beats");
+    }
+
+    #[test]
+    fn no_packets_fade_to_black() {
+        let mut a = Analyzer::default();
+        let (f, _) = a.push(&sine(1000.0, 0.5, 48000), 48000).unwrap();
+        assert!(f.level > 0.0);
+        assert!(f.bands.iter().copied().fold(0.0, f32::max) > 0.5, "{:?}", f.bands);
+        // Then the loopback goes quiet: polls every 10 ms with no packets.
+        let t0 = Instant::now();
+        let mut gaps = GapFiller::new(t0);
+        let mut last = f;
+        let mut mono = Vec::new();
+        for i in 1..=200 {
+            mono.clear();
+            gaps.fill(&mut mono, 48000, t0 + Duration::from_millis(10 * i));
+            if let Some((f, _)) = a.push(&mono, 48000) {
+                last = f;
+            }
+        }
+        assert!(last.level < 0.01, "level {}", last.level);
+        assert!(last.bands.iter().all(|&b| b < 0.01), "{:?}", last.bands);
+
+        // Real samples reset the gap; short gaps add nothing.
+        let mut gaps = GapFiller::new(t0);
+        let mut m = vec![0.5; 10];
+        gaps.fill(&mut m, 48000, t0 + Duration::from_secs(5));
+        assert_eq!(m.len(), 10);
+        m.clear();
+        gaps.fill(&mut m, 48000, t0 + Duration::from_secs(5) + Duration::from_millis(10));
+        assert!(m.is_empty());
+        // A long stall adds at most a second.
+        gaps.fill(&mut m, 48000, t0 + Duration::from_secs(60));
+        assert_eq!(m.len(), 48000);
     }
 
     #[test]
