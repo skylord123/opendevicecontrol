@@ -313,7 +313,8 @@ mod imp {
                 return Err(std::io::ErrorKind::TimedOut.into());
             }
             s.set_read_timeout(Some(left))?;
-            let n = s.read(&mut chunk[..(max - buf.len()).min(chunk.len())])?;
+            let want = (max - buf.len()).min(chunk.len());
+            let n = s.read(&mut chunk[..want])?;
             if n == 0 {
                 break;
             }
