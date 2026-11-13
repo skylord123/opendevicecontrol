@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=OpenDeviceControl
+GenericName=Hardware Monitor
+Comment=Monitor and control PC hardware and peripherals; Home Assistant integration
+Exec=opendevicecontrol
+Icon=opendevicecontrol
+Terminal=false
+Categories=System;Monitor;HardwareSettings;
+Keywords=corsair;rgb;keyboard;psu;fan;sensors;hardware;home assistant;mqtt;
+StartupWMClass=opendevicecontrol

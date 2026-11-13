@@ -1,0 +1,21 @@
+# opendevicecontrol: give the logged-in user access to Corsair and Aula USB HID devices, and
+# to /dev/uinput for G-key macros (typing keys / text on the user's behalf).
+# Install: sudo cp 60-opendevicecontrol.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger
+
+# All Corsair HID devices (power supplies, keyboards, mice, coolers, hubs…)
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1b1c", TAG+="uaccess"
+
+# Aula keyboards: the 2.4 GHz receiver and the USB cable connection
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3554", ATTRS{idProduct}=="fa09", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="258a", ATTRS{idProduct}=="010c", TAG+="uaccess"
+
+# Corsair RGB memory (experimental; only used when enabled in opendevicecontrol
+# Settings): the chipset SMBus adapters only (Intel i801, AMD PIIX4), never
+# GPU/display I2C buses. Needs the i2c-dev module. This gives the desktop
+# user raw SMBus access (like OpenRGB's "i2c" group); delete these two lines
+# if you don't use RAM lighting. See docs/ram.md.
+SUBSYSTEM=="i2c-dev", KERNEL=="i2c-[0-9]*", ATTRS{name}=="SMBus I801 adapter*", TAG+="uaccess"
+SUBSYSTEM=="i2c-dev", KERNEL=="i2c-[0-9]*", ATTRS{name}=="SMBus PIIX4 adapter*", TAG+="uaccess"
+
+# Virtual keyboard for key actions
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"

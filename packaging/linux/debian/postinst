@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+# Apply the udev rule so the logged-in user can access the devices now,
+# without unplugging them or rebooting.
+if [ "$1" = "configure" ] && command -v udevadm >/dev/null 2>&1; then
+    udevadm control --reload-rules || true
+    udevadm trigger --subsystem-match=hidraw --action=change || true
+fi
+# i2c-dev for RAM lighting (also loaded at boot via modules-load.d).
+if [ "$1" = "configure" ] && command -v modprobe >/dev/null 2>&1; then
+    modprobe i2c-dev 2>/dev/null || true
+    command -v udevadm >/dev/null 2>&1 && udevadm trigger --subsystem-match=i2c-dev --action=change || true
+fi

@@ -1,0 +1,14 @@
+#!/bin/sh
+set -e
+# Stop running copies cleanly (hands the PSU fan back to hardware control)
+# before the binary is removed or replaced. Runs as root, so ask each
+# user's instance through their own runtime socket.
+if [ "$1" = "remove" ] || [ "$1" = "upgrade" ]; then
+    for sock in /run/user/*/opendevicecontrol-*.sock; do
+        [ -S "$sock" ] || continue
+        uid="${sock#/run/user/}"; uid="${uid%%/*}"
+        user="$(getent passwd "$uid" | cut -d: -f1)" || continue
+        [ -n "$user" ] || continue
+        su -s /bin/sh "$user" -c "XDG_RUNTIME_DIR=/run/user/$uid /usr/bin/opendevicecontrol --quit" >/dev/null 2>&1 || true
+    done
+fi

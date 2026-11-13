@@ -1,0 +1,121 @@
+[package]
+name = "opendevicecontrol"
+description = "Open-source monitor and controller for PC hardware and peripherals, with Home Assistant integration"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+authors = ["Skylar Sadlier"]
+keywords = ["corsair", "psu", "home-assistant", "mqtt", "icue"]
+categories = ["hardware-support", "gui"]
+
+[features]
+default = []
+# Windows: build a console program (opendevicecontrol-cli.exe) instead of a windowed
+# one, so --probe / --headless print to the terminal and wait for it.
+console = []
+
+[dependencies]
+anyhow = "1.0.104"
+crossbeam-channel = "0.5.17"
+ctrlc = "3.5.2"
+dirs = "7.0.0"
+# OpenGL (glow) renderer: lighter than wgpu, and wgpu panics on the transient
+# invalid window sizes Windows can report while resizing/restoring.
+eframe = { version = "0.37", default-features = false, features = ["glow", "accesskit", "clipboard", "default_fonts", "links", "system_fonts", "wayland", "x11"] }
+egui_plot = "0.38"
+opendevicecontrol-core = { path = "../opendevicecontrol-core" }
+gethostname = "1.1.0"
+log = "0.4.35"
+parking_lot = "0.12.5"
+png = "0.18.1"
+raw-window-handle = "0.6.2"
+rumqttc = { version = "0.25.1", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+simplelog = "0.12.2"
+single-instance = "0.3.3"
+sysinfo = "0.37"
+toml = "1.0.7"
+tray-icon = "0.26"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_UI_Shell"] }
+winreg = "0.56.0"
+# Sound-reactive lighting: capture what is playing (WASAPI loopback).
+wasapi = "0.27.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = "0.13.2"
+gtk = "0.18.2"
+# Sound-reactive lighting: record the default output's monitor through
+# PulseAudio's API (served by PipeWire on Pop!_OS, Fedora, Ubuntu…).
+libpulse-binding = "2.30.1"
+libpulse-simple-binding = "2.29.0"
+
+[build-dependencies]
+png = "0.18.1"
+winresource = "0.1.34"
+
+# `cargo deb -p opendevicecontrol` (after a release build) builds an Ubuntu/Debian/Pop!_OS package.
+# Paths are relative to this crate; target/release is resolved to the workspace target dir.
+[package.metadata.deb]
+name = "opendevicecontrol"
+section = "utils"
+priority = "optional"
+# The tray icon library is loaded at runtime, so it is not found by $auto.
+depends = "$auto, libayatana-appindicator3-1 | libappindicator3-1"
+recommends = "udev"
+extended-description = """\
+Open-source monitor and controller for PC hardware and peripherals, \
+replacing Corsair iCUE / LINK for supported devices. Shows live power, per-rail voltage, \
+current and power, temperatures and fan speed, controls the PSU fan and OCP \
+mode, runs in the system tray and publishes everything to Home Assistant \
+via MQTT discovery. Installs a udev rule so the logged-in user can access \
+the devices without root."""
+maintainer-scripts = "../../packaging/linux/debian/"
+assets = [
+    ["target/release/opendevicecontrol", "usr/bin/", "755"],
+    ["../../packaging/linux/opendevicecontrol.desktop", "usr/share/applications/", "644"],
+    ["../../packaging/linux/60-opendevicecontrol.rules", "usr/lib/udev/rules.d/", "644"],
+    ["../../packaging/linux/modules-load.d/opendevicecontrol-i2c.conf", "usr/lib/modules-load.d/", "644"],
+    ["../../packaging/linux/opendevicecontrol.service", "usr/share/doc/opendevicecontrol/examples/", "644"],
+    ["../../assets/icons/opendevicecontrol-16.png", "usr/share/icons/hicolor/16x16/apps/opendevicecontrol.png", "644"],
+    ["../../assets/icons/opendevicecontrol-24.png", "usr/share/icons/hicolor/24x24/apps/opendevicecontrol.png", "644"],
+    ["../../assets/icons/opendevicecontrol-32.png", "usr/share/icons/hicolor/32x32/apps/opendevicecontrol.png", "644"],
+    ["../../assets/icons/opendevicecontrol-48.png", "usr/share/icons/hicolor/48x48/apps/opendevicecontrol.png", "644"],
+    ["../../assets/icons/opendevicecontrol-64.png", "usr/share/icons/hicolor/64x64/apps/opendevicecontrol.png", "644"],
+    ["../../assets/icons/opendevicecontrol-128.png", "usr/share/icons/hicolor/128x128/apps/opendevicecontrol.png", "644"],
+    ["../../assets/icons/opendevicecontrol-256.png", "usr/share/icons/hicolor/256x256/apps/opendevicecontrol.png", "644"],
+    ["../../assets/icons/opendevicecontrol-512.png", "usr/share/icons/hicolor/512x512/apps/opendevicecontrol.png", "644"],
+    ["../../README.md", "usr/share/doc/opendevicecontrol/README.md", "644"],
+]
+
+# `cargo generate-rpm -p crates/opendevicecontrol` (after a release build) builds a Fedora/openSUSE package.
+[package.metadata.generate-rpm]
+name = "opendevicecontrol"
+summary = "PC hardware and peripheral monitor/controller with Home Assistant integration"
+license = "GPL-3.0-or-later"
+post_install_script = "udevadm control --reload-rules >/dev/null 2>&1 || :; udevadm trigger --subsystem-match=hidraw --action=change >/dev/null 2>&1 || :; modprobe i2c-dev >/dev/null 2>&1 || :; udevadm trigger --subsystem-match=i2c-dev --action=change >/dev/null 2>&1 || :"
+post_uninstall_script = "udevadm control --reload-rules >/dev/null 2>&1 || :"
+assets = [
+    { source = "target/release/opendevicecontrol", dest = "/usr/bin/opendevicecontrol", mode = "755" },
+    { source = "../../packaging/linux/opendevicecontrol.desktop", dest = "/usr/share/applications/opendevicecontrol.desktop", mode = "644" },
+    { source = "../../packaging/linux/60-opendevicecontrol.rules", dest = "/usr/lib/udev/rules.d/60-opendevicecontrol.rules", mode = "644" },
+    { source = "../../packaging/linux/modules-load.d/opendevicecontrol-i2c.conf", dest = "/usr/lib/modules-load.d/opendevicecontrol-i2c.conf", mode = "644" },
+    { source = "../../assets/icons/opendevicecontrol-16.png", dest = "/usr/share/icons/hicolor/16x16/apps/opendevicecontrol.png", mode = "644" },
+    { source = "../../assets/icons/opendevicecontrol-24.png", dest = "/usr/share/icons/hicolor/24x24/apps/opendevicecontrol.png", mode = "644" },
+    { source = "../../assets/icons/opendevicecontrol-32.png", dest = "/usr/share/icons/hicolor/32x32/apps/opendevicecontrol.png", mode = "644" },
+    { source = "../../assets/icons/opendevicecontrol-48.png", dest = "/usr/share/icons/hicolor/48x48/apps/opendevicecontrol.png", mode = "644" },
+    { source = "../../assets/icons/opendevicecontrol-64.png", dest = "/usr/share/icons/hicolor/64x64/apps/opendevicecontrol.png", mode = "644" },
+    { source = "../../assets/icons/opendevicecontrol-128.png", dest = "/usr/share/icons/hicolor/128x128/apps/opendevicecontrol.png", mode = "644" },
+    { source = "../../assets/icons/opendevicecontrol-256.png", dest = "/usr/share/icons/hicolor/256x256/apps/opendevicecontrol.png", mode = "644" },
+    { source = "../../assets/icons/opendevicecontrol-512.png", dest = "/usr/share/icons/hicolor/512x512/apps/opendevicecontrol.png", mode = "644" },
+    { source = "../../packaging/linux/opendevicecontrol.service", dest = "/usr/share/doc/opendevicecontrol/examples/opendevicecontrol.service", mode = "644", doc = true },
+    { source = "../../README.md", dest = "/usr/share/doc/opendevicecontrol/README.md", mode = "644", doc = true },
+    { source = "../../LICENSE", dest = "/usr/share/licenses/opendevicecontrol/LICENSE", mode = "644" },
+]
+
+[package.metadata.generate-rpm.requires]
+"libayatana-appindicator3.so.1()(64bit)" = "*"

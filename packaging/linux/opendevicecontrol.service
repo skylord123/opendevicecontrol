@@ -1,0 +1,20 @@
+# Optional: run opendevicecontrol WITHOUT the GUI as a systemd user service
+# (e.g. a headless machine). Do not combine with GUI autostart — only one
+# instance can own the devices.
+#
+#   cp opendevicecontrol.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now opendevicecontrol
+#   loginctl enable-linger "$USER"   # keep running when logged out
+[Unit]
+Description=opendevicecontrol Corsair device service (headless)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/opendevicecontrol --headless
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/opendevicecontrol-core", "crates/opendevicecontrol"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/skylord123/opendevicecontrol"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
