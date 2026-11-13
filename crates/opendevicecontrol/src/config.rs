@@ -143,6 +143,10 @@ pub struct Config {
     pub mqtt: Mqtt,
     /// Fan policy per `"<device id>/<fan channel>"`.
     pub fans: BTreeMap<String, FanPolicy>,
+    /// Per `"<device id>/<fan channel>"`: the settings of each fan mode, so
+    /// switching to another mode and back restores them.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub fan_memory: BTreeMap<String, FanMemory>,
     /// Lighting per device id.
     pub lighting: BTreeMap<String, Lighting>,
     /// Action per `"<device id>/<key id>"` (G-keys etc.).
@@ -561,6 +565,34 @@ pub enum FanPolicy {
     },
 }
 
+/// The last settings used in each fan mode of a channel.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FanMemory {
+    /// Last Fixed duty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duty: Option<u8>,
+    /// Last Curve points; `None` while no curve was ever set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub points: Option<Vec<(f64, u8)>>,
+    /// Last Curve input (meaningful only with `points`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+impl FanMemory {
+    fn remember(&mut self, p: &FanPolicy) {
+        match p {
+            FanPolicy::Hardware => {}
+            FanPolicy::Fixed { duty } => self.duty = Some(*duty),
+            FanPolicy::Curve { points, source } => {
+                self.points = Some(points.clone());
+                self.source = source.clone();
+            }
+        }
+    }
+}
+
 /// Pseudo device id for host sensors (CPU temperature…) usable as curve input.
 pub const SYSTEM_SOURCE: &str = "system";
 
@@ -582,15 +614,6 @@ impl FanPolicy {
 
     pub fn default_curve() -> Vec<(f64, u8)> {
         vec![(30.0, 30), (40.0, 35), (50.0, 50), (60.0, 75), (65.0, 100)]
-    }
-
-    pub fn from_mode(name: &str, previous_duty: u8) -> Option<Self> {
-        match name {
-            "Hardware" => Some(FanPolicy::Hardware),
-            "Fixed" => Some(FanPolicy::Fixed { duty: previous_duty }),
-            "Curve" => Some(FanPolicy::Curve { points: Self::default_curve(), source: None }),
-            _ => None,
-        }
     }
 }
 
@@ -654,6 +677,7 @@ impl Config {
         migrate_ids(&mut self.keys);
         migrate_ids(&mut self.settings);
         merge_devices(&mut self.fans);
+        merge_devices(&mut self.fan_memory);
         merge_devices(&mut self.lighting);
         merge_devices(&mut self.keys);
         merge_devices(&mut self.toggles);
@@ -661,7 +685,13 @@ impl Config {
         merge_devices(&mut self.ha_sensors);
     }
 
+    /// Write the file. Saves are serialized (see [`save_shared`]).
     pub fn save(&self) -> std::io::Result<()> {
+        let _g = SAVE_LOCK.lock();
+        self.save_unlocked()
+    }
+
+    fn save_unlocked(&self) -> std::io::Result<()> {
         let path = Self::path();
         std::fs::create_dir_all(path.parent().unwrap())?;
         let s = toml::to_string_pretty(self).map_err(std::io::Error::other)?;
@@ -689,7 +719,40 @@ impl Config {
     }
 
     pub fn set_fan_policy(&mut self, device: &str, channel: &str, p: FanPolicy) {
-        self.fans.insert(format!("{device}/{channel}"), p);
+        let key = format!("{device}/{channel}");
+        let mem = self.fan_memory.entry(key.clone()).or_default();
+        // Configs written before `fan_memory` existed only have the
+        // current mode's settings: keep them too.
+        if let Some(old) = self.fans.get(&key) {
+            mem.remember(old);
+        }
+        mem.remember(&p);
+        if *mem == FanMemory::default() {
+            self.fan_memory.remove(&key);
+        }
+        self.fans.insert(key, p);
+    }
+
+    /// The policy for switching a channel to `mode` ("Hardware", "Fixed",
+    /// "Curve"), with that mode's last settings. `fixed_fallback` is the
+    /// duty used when Fixed was never set.
+    pub fn fan_policy_for_mode(&self, device: &str, channel: &str, mode: &str, fixed_fallback: u8) -> Option<FanPolicy> {
+        let key = format!("{device}/{channel}");
+        let current = self.fan_policy(device, channel);
+        if current.mode_name() == mode {
+            return Some(current);
+        }
+        let mut mem = self.fan_memory.get(&key).cloned().unwrap_or_default();
+        mem.remember(&current);
+        match mode {
+            "Hardware" => Some(FanPolicy::Hardware),
+            "Fixed" => Some(FanPolicy::Fixed { duty: mem.duty.unwrap_or(fixed_fallback) }),
+            "Curve" => Some(match mem.points {
+                Some(points) => FanPolicy::Curve { points, source: mem.source },
+                None => FanPolicy::Curve { points: FanPolicy::default_curve(), source: None },
+            }),
+            _ => None,
+        }
     }
 
     pub fn lighting(&self, device: &str) -> Lighting {
@@ -701,19 +764,44 @@ impl Config {
     }
 }
 
-/// Write a file readable only by the current user (it may hold the MQTT password).
+/// Serializes config file writes, so they reach the disk in order.
+static SAVE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// Save the shared configuration. The snapshot is taken while holding the
+/// save lock, so whichever save runs last writes the newest settings, even
+/// when several threads change and save the config at once.
+pub fn save_shared(config: &parking_lot::RwLock<Config>) -> std::io::Result<()> {
+    let _g = SAVE_LOCK.lock();
+    let snapshot = config.read().clone();
+    snapshot.save_unlocked()
+}
+
+/// Write a file readable only by the current user (it may hold the MQTT
+/// password), atomically through a temporary file of its own.
 fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    #[cfg(unix)]
-    {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = path.with_file_name(format!(".{name}.{}.{}.tmp", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+    let res = (|| {
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp)?;
         f.write_all(data)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    #[cfg(not(unix))]
-    std::fs::write(&tmp, data)?;
-    std::fs::rename(tmp, path)
+    res
 }
 
 /// Runtime state that survives restarts (energy counters).
@@ -853,6 +941,73 @@ pawnio = true
         let s = toml::to_string_pretty(&c).unwrap();
         let back: Config = toml::from_str(&s).unwrap();
         assert_eq!(c, back);
+    }
+
+    #[test]
+    fn fan_modes_remember_their_settings() {
+        let curve = FanPolicy::Curve { points: vec![(35.0, 40), (70.0, 100)], source: Some("system/cpu_temp".into()) };
+        let mut c = Config::default();
+        c.set_fan_policy("hx850i", "fan", curve.clone());
+        let to = |c: &Config, m| c.fan_policy_for_mode("hx850i", "fan", m, 50).unwrap();
+        // Curve -> Fixed (never set: fallback) -> Fixed 70 -> Curve.
+        assert_eq!(to(&c, "Fixed"), FanPolicy::Fixed { duty: 50 });
+        c.set_fan_policy("hx850i", "fan", FanPolicy::Fixed { duty: 70 });
+        assert_eq!(to(&c, "Curve"), curve);
+        c.set_fan_policy("hx850i", "fan", to(&c, "Curve"));
+        // ... -> Hardware -> Fixed comes back at 70, and survives a restart.
+        c.set_fan_policy("hx850i", "fan", FanPolicy::Hardware);
+        let back: Config = toml::from_str(&toml::to_string_pretty(&c).unwrap()).unwrap();
+        assert_eq!(back, c);
+        assert_eq!(to(&back, "Fixed"), FanPolicy::Fixed { duty: 70 });
+        assert_eq!(to(&back, "Curve"), curve);
+        assert_eq!(to(&back, "Hardware"), FanPolicy::Hardware);
+        assert_eq!(back.fan_policy_for_mode("hx850i", "fan", "Bogus", 50), None);
+        // A channel never configured gets the defaults.
+        assert_eq!(
+            back.fan_policy_for_mode("other", "fan", "Curve", 50),
+            Some(FanPolicy::Curve { points: FanPolicy::default_curve(), source: None })
+        );
+    }
+
+    #[test]
+    fn old_fan_config_keeps_its_curve_when_switching() {
+        // Written before `fan_memory` existed: only the current mode.
+        let old = "[fans.\"hx850i/fan\"]
+mode = \"curve\"
+points = [[30.0, 30], [60.0, 100]]
+source = \"system/cpu_temp\"
+";
+        let mut c: Config = toml::from_str(old).unwrap();
+        let curve = c.fan_policy("hx850i", "fan");
+        c.set_fan_policy("hx850i", "fan", FanPolicy::Fixed { duty: 60 });
+        assert_eq!(c.fan_policy_for_mode("hx850i", "fan", "Curve", 50), Some(curve));
+    }
+
+    #[test]
+    fn concurrent_private_writes_do_not_collide() {
+        let dir = std::env::temp_dir().join(format!("odc-config-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for j in 0..20 {
+                        write_private(&path, format!("writer {i} pass {j}\n").repeat(200).as_bytes()).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        // The file holds one writer's complete data, and no temp files remain.
+        let s = std::fs::read_to_string(&path).unwrap();
+        let first = s.lines().next().unwrap().to_string();
+        assert!(s.lines().all(|l| l == first) && s.lines().count() == 200);
+        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(left.len(), 1, "{left:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

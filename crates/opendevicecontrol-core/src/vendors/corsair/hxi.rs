@@ -142,6 +142,45 @@ pub struct HxiPsu {
     software_fan: bool,
 }
 
+fn write_reg(io: &HidTransport, c: u8, data: &[u8]) -> Result<()> {
+    let mut p = vec![HDR_WRITE, c];
+    p.extend_from_slice(data);
+    io.transact(&p, 2).map(|_| ())
+}
+
+/// Switch the fan between firmware control and a software duty through
+/// `write(register, data)`, keeping `software_fan` in step with the PSU.
+/// If the duty write fails after software mode is on, the fan goes back to
+/// firmware control rather than staying in software mode at an unknown duty.
+fn apply_fan_target(software_fan: &mut bool, target: FanTarget, mut write: impl FnMut(u8, &[u8]) -> Result<()>) -> Result<()> {
+    match target {
+        FanTarget::Hardware => {
+            if *software_fan {
+                write(cmd::FAN_CONTROL_MODE, &[0])?;
+                *software_fan = false;
+            }
+        }
+        FanTarget::Duty(d) => {
+            if !*software_fan {
+                write(cmd::FAN_CONTROL_MODE, &[1])?;
+                *software_fan = true;
+            }
+            if let Err(e) = write(cmd::FAN_COMMAND_1, &[d.clamp(MIN_FAN_DUTY, 100)]) {
+                match write(cmd::FAN_CONTROL_MODE, &[0]) {
+                    Ok(()) => {
+                        *software_fan = false;
+                        log::warn!("fan duty write failed ({e}); returned the fan to hardware control");
+                    }
+                    // Mode unknown: keep `software_fan` so release retries.
+                    Err(e2) => log::warn!("fan duty write failed ({e}); restoring hardware control also failed: {e2}"),
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(())
+}
+
 impl HxiPsu {
     pub fn open(dev: hidapi::HidDevice, model: &'static PsuModel, id: String, serial: Option<String>) -> Result<Self> {
         let io = HidTransport::new(dev);
@@ -184,9 +223,7 @@ impl HxiPsu {
     }
 
     fn write(&self, c: u8, data: &[u8]) -> Result<()> {
-        let mut p = vec![HDR_WRITE, c];
-        p.extend_from_slice(data);
-        self.io.transact(&p, 2).map(|_| ())
+        write_reg(&self.io, c, data)
     }
 
     fn read_linear(&self, c: u8) -> Result<f64> {
@@ -391,22 +428,8 @@ impl Device for HxiPsu {
     }
 
     fn set_fan(&mut self, _channel: &str, target: FanTarget) -> Result<()> {
-        match target {
-            FanTarget::Hardware => {
-                if self.software_fan {
-                    self.write(cmd::FAN_CONTROL_MODE, &[0])?;
-                    self.software_fan = false;
-                }
-            }
-            FanTarget::Duty(d) => {
-                if !self.software_fan {
-                    self.write(cmd::FAN_CONTROL_MODE, &[1])?;
-                    self.software_fan = true;
-                }
-                self.write(cmd::FAN_COMMAND_1, &[d.clamp(MIN_FAN_DUTY, 100)])?;
-            }
-        }
-        Ok(())
+        let io = &self.io;
+        apply_fan_target(&mut self.software_fan, target, |c, data| write_reg(io, c, data))
     }
 
     fn release(&mut self) {
@@ -421,6 +444,41 @@ impl Device for HxiPsu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runs `apply_fan_target` against a fake that fails writes to `fail`.
+    fn run(software: bool, target: FanTarget, fail: &[u8]) -> (Result<()>, bool, Vec<(u8, u8)>) {
+        let mut sw = software;
+        let mut log = Vec::new();
+        let r = apply_fan_target(&mut sw, target, |c, d| {
+            log.push((c, d[0]));
+            if fail.contains(&c) { Err(Error::NoReply { cmd: c }) } else { Ok(()) }
+        });
+        (r, sw, log)
+    }
+
+    #[test]
+    fn fan_duty_enters_software_mode_once() {
+        let (r, sw, log) = run(false, FanTarget::Duty(60), &[]);
+        assert!(r.is_ok() && sw);
+        assert_eq!(log, vec![(cmd::FAN_CONTROL_MODE, 1), (cmd::FAN_COMMAND_1, 60)]);
+        let (_, _, log) = run(true, FanTarget::Duty(60), &[]);
+        assert_eq!(log, vec![(cmd::FAN_COMMAND_1, 60)]);
+    }
+
+    #[test]
+    fn failed_duty_write_returns_fan_to_hardware() {
+        let (r, sw, log) = run(false, FanTarget::Duty(60), &[cmd::FAN_COMMAND_1]);
+        assert!(r.is_err());
+        assert!(!sw, "back under firmware control");
+        assert_eq!(log, vec![(cmd::FAN_CONTROL_MODE, 1), (cmd::FAN_COMMAND_1, 60), (cmd::FAN_CONTROL_MODE, 0)]);
+        // If the fallback fails too, the mode stays marked as software so
+        // release tries again.
+        let (r, sw, _) = run(false, FanTarget::Duty(60), &[cmd::FAN_COMMAND_1, cmd::FAN_CONTROL_MODE]);
+        assert!(r.is_err() && !sw, "mode write itself failed, never entered software mode");
+        let (r, sw, log) = run(true, FanTarget::Duty(60), &[cmd::FAN_COMMAND_1, cmd::FAN_CONTROL_MODE]);
+        assert!(r.is_err() && sw);
+        assert_eq!(log.last(), Some(&(cmd::FAN_CONTROL_MODE, 0)));
+    }
 
     #[test]
     fn hx850i_input_estimate_is_sane() {

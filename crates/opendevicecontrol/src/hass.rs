@@ -489,18 +489,10 @@ impl<'a> Session<'a> {
             return;
         }
         for ch in &view.fans {
-            let policy = self.h.config.read().fan_policy(dev, &ch.id);
-            let fixed = match &policy {
-                FanPolicy::Fixed { duty } => *duty,
-                _ => 50,
-            };
             if ctrl == format!("{}_mode", ch.id) {
-                if let Some(p) = FanPolicy::from_mode(text, fixed) {
-                    // Keep an existing custom curve when switching back to Curve.
-                    let p = match (p, &policy) {
-                        (FanPolicy::Curve { .. }, FanPolicy::Curve { .. }) => policy.clone(),
-                        (p, _) => p,
-                    };
+                // Back to the mode's last settings (curve, input, duty).
+                let p = self.h.config.read().fan_policy_for_mode(dev, &ch.id, text, 50);
+                if let Some(p) = p {
                     self.h.set_fan_policy(dev, &ch.id, p);
                 }
                 return;

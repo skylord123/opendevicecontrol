@@ -1005,15 +1005,12 @@ impl FerroApp {
             ui.label(RichText::new(&ch.name).strong());
             for m in FanPolicy::MODES {
                 if ui.selectable_label(policy.mode_name() == m, m).clicked() && policy.mode_name() != m {
+                    // Back to the mode's last settings (curve, input, duty).
                     let fixed = *self.fixed_drafts.get(&key).unwrap_or(&50);
-                    let p = match m {
-                        "Curve" => FanPolicy::Curve {
-                            points: self.curve_drafts.get(&key).cloned().unwrap_or_else(FanPolicy::default_curve),
-                            source: None,
-                        },
-                        other => FanPolicy::from_mode(other, fixed).unwrap(),
-                    };
-                    self.h.set_fan_policy(&d.info.id, &ch.id, p);
+                    let p = self.h.config.read().fan_policy_for_mode(&d.info.id, &ch.id, m, fixed);
+                    if let Some(p) = p {
+                        self.h.set_fan_policy(&d.info.id, &ch.id, p);
+                    }
                 }
             }
         });

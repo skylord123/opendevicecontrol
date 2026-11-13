@@ -30,6 +30,18 @@ pub type Series = VecDeque<[f64; 2]>;
 const FRAME: Duration = Duration::from_millis(33);
 /// Key input polling interval for devices that report keys.
 const INPUT_TICK: Duration = Duration::from_millis(10);
+/// Consecutive failed polls before a worker gives up and rescans.
+const POLL_FAIL_LIMIT: u32 = 5;
+/// Consecutive failed lighting frames before a worker gives up. Frames come
+/// up to 30 times a second, so a short burst of errors is tolerated.
+const LIGHT_FAIL_LIMIT: u32 = 30;
+/// After a failed poll, retry this soon even when the poll interval is long.
+const POLL_RETRY: Duration = Duration::from_secs(2);
+/// Without a good sample for this long, fan curves fed by the device's own
+/// sensors go to full speed.
+const COOLING_FAILSAFE_AFTER: Duration = Duration::from_secs(10);
+/// System temperatures older than this are not used as curve input.
+const SYSTEM_SOURCE_MAX_AGE: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone)]
 pub struct DeviceView {
@@ -96,6 +108,8 @@ pub struct Shared {
     /// Host sensors (CPU temperature…) usable as fan-curve inputs, as
     /// `system/<id>` sources. Empty where the OS does not expose them.
     pub system_sensors: Vec<Sensor>,
+    /// When `system_sensors` was last refreshed.
+    pub system_updated: Option<Instant>,
     /// RAM (SMBus) support status for Settings; `None` while disabled.
     pub ram_status: Option<String>,
     /// Extra temperature sources (Windows: PawnIO, HWiNFO,
@@ -176,12 +190,8 @@ impl Handle {
 
     /// Update configuration, persist it and let the service react.
     pub fn update_config(&self, f: impl FnOnce(&mut Config)) {
-        let snapshot = {
-            let mut c = self.config.write();
-            f(&mut c);
-            c.clone()
-        };
-        if let Err(e) = snapshot.save() {
+        f(&mut self.config.write());
+        if let Err(e) = crate::config::save_shared(&self.config) {
             log::error!("saving config: {e}");
         }
         let _ = self.cmd.send(Command::ConfigChanged);
@@ -219,6 +229,7 @@ pub fn start(config: Arc<RwLock<Config>>) -> Handle {
         conflicts: Vec::new(),
         mqtt: MqttStatus::Disabled,
         system_sensors: Vec::new(),
+        system_updated: None,
         ram_status: None,
         sensor_status: Vec::new(),
     }));
@@ -380,6 +391,7 @@ fn manager(h: Handle, rx: Receiver<Command>) {
             {
                 let mut sh = h.shared.write();
                 sh.system_sensors = sensors;
+                sh.system_updated = Some(Instant::now());
                 sh.sensor_status = status;
             }
             next_system = Instant::now() + Duration::from_secs(5);
@@ -397,7 +409,9 @@ fn manager(h: Handle, rx: Receiver<Command>) {
 struct WorkerState {
     applied_fans: HashMap<String, (FanTarget, Instant)>,
     last_sample: Option<Instant>,
-    failures: u32,
+    /// Consecutive failed polls / lighting frames, counted separately.
+    poll_failures: u32,
+    light_failures: u32,
 }
 
 /// Keymap work for a device worker.
@@ -574,7 +588,7 @@ fn worker(h: Handle, state: Arc<Mutex<State>>, mut dev: Box<dyn Device>, rx: Rec
         }
     }
 
-    let mut ws = WorkerState { applied_fans: HashMap::new(), last_sample: None, failures: 0 };
+    let mut ws = WorkerState { applied_fans: HashMap::new(), last_sample: None, poll_failures: 0, light_failures: 0 };
     let started = h.shared.read().started;
     let mut next_poll = Instant::now();
     let mut next_frame = Instant::now();
@@ -677,14 +691,19 @@ fn worker(h: Handle, state: Arc<Mutex<State>>, mut dev: Box<dyn Device>, rx: Rec
             });
             match if own { Ok(()) } else { dev.set_lights(&frame) } {
                 Ok(()) => {
+                    let recovered = std::mem::take(&mut ws.light_failures) > 0;
                     let changed = {
                         let mut s = h.shared.write();
                         match s.devices.get_mut(&id) {
-                            Some(v) if v.lights != frame => {
+                            Some(v) => {
+                                if recovered && ws.poll_failures == 0 {
+                                    v.last_error = None;
+                                }
+                                let changed = recovered || v.lights != frame;
                                 v.lights = frame;
-                                true
+                                changed
                             }
-                            _ => false,
+                            None => false,
                         }
                     };
                     if changed {
@@ -692,7 +711,7 @@ fn worker(h: Handle, state: Arc<Mutex<State>>, mut dev: Box<dyn Device>, rx: Rec
                     }
                 }
                 Err(e) => {
-                    if fail(&h, &id, &mut ws, &e.to_string()) {
+                    if fail(&h, &id, &mut ws.light_failures, LIGHT_FAIL_LIMIT, &format!("lighting: {e}")) {
                         dev.release();
                         return;
                     }
@@ -709,7 +728,7 @@ fn worker(h: Handle, state: Arc<Mutex<State>>, mut dev: Box<dyn Device>, rx: Rec
             next_poll = now + interval;
             match dev.poll() {
                 Ok(mut snap) => {
-                    ws.failures = 0;
+                    ws.poll_failures = 0;
                     let cfg = h.config.read().clone();
                     // Energy integration of the (estimated) AC input power.
                     let pin = snap.sensor("input_power").or_else(|| snap.sensor("output_power"));
@@ -741,7 +760,9 @@ fn worker(h: Handle, state: Arc<Mutex<State>>, mut dev: Box<dyn Device>, rx: Rec
                         v.keymap_info = keymap_info;
                         // Devices that change links (Aula) change their USB ids.
                         v.info = dev.info().clone();
-                        v.last_error = None;
+                        if ws.light_failures == 0 {
+                            v.last_error = None;
+                        }
                         v.last_update = Some(now);
                         let t = now.duration_since(started).as_secs_f64();
                         let history = Arc::make_mut(&mut v.history);
@@ -766,9 +787,17 @@ fn worker(h: Handle, state: Arc<Mutex<State>>, mut dev: Box<dyn Device>, rx: Rec
                     h.notify();
                 }
                 Err(e) => {
-                    if fail(&h, &id, &mut ws, &e.to_string()) {
+                    if fail(&h, &id, &mut ws.poll_failures, POLL_FAIL_LIMIT, &e.to_string()) {
                         dev.release();
                         return;
+                    }
+                    // No fresh temperatures: retry soon, and once the last
+                    // good sample is too old, run curves on the device's own
+                    // sensors at full speed (fan writes may still work).
+                    next_poll = now + interval.min(POLL_RETRY);
+                    if cooling_failsafe_due(ws.last_sample, now) {
+                        let cfg = h.config.read().clone();
+                        apply_fans(&h, &mut *dev, &mut ws, &cfg, &[]);
                     }
                 }
             }
@@ -776,12 +805,17 @@ fn worker(h: Handle, state: Arc<Mutex<State>>, mut dev: Box<dyn Device>, rx: Rec
     }
 }
 
+/// Whether fans should stop trusting the device's last temperatures.
+fn cooling_failsafe_due(last_sample: Option<Instant>, now: Instant) -> bool {
+    last_sample.is_none_or(|t| now.saturating_duration_since(t) >= COOLING_FAILSAFE_AFTER)
+}
+
 /// Record a failure; returns true when the worker should give up (the
 /// manager then rescans, so an unplugged or reset device comes back).
-fn fail(h: &Handle, id: &str, ws: &mut WorkerState, err: &str) -> bool {
-    ws.failures += 1;
-    log::warn!("{id}: {err} ({}x)", ws.failures);
-    let give_up = ws.failures >= 5;
+fn fail(h: &Handle, id: &str, failures: &mut u32, limit: u32, err: &str) -> bool {
+    *failures += 1;
+    log::warn!("{id}: {err} ({}x)", *failures);
+    let give_up = *failures >= limit;
     if let Some(v) = h.shared.write().devices.get_mut(id) {
         v.last_error = Some(err.to_string());
         if give_up {
@@ -822,11 +856,13 @@ fn remember_toggles(h: &Handle, cfg: &Config, id: &str, controls: &[Control]) {
         })
         .collect();
     if !changed.is_empty() {
-        let mut c = h.config.write();
-        for (k, v) in changed {
-            c.toggles.insert(k, v);
+        {
+            let mut c = h.config.write();
+            for (k, v) in changed {
+                c.toggles.insert(k, v);
+            }
         }
-        if let Err(e) = c.save() {
+        if let Err(e) = crate::config::save_shared(&h.config) {
             log::warn!("saving config: {e}");
         }
     }
@@ -843,11 +879,13 @@ fn remember_settings(h: &Handle, cfg: &Config, id: &str, remembered: &[String], 
         })
         .collect();
     if !changed.is_empty() {
-        let mut c = h.config.write();
-        for (k, v) in changed {
-            c.settings.insert(k, v);
+        {
+            let mut c = h.config.write();
+            for (k, v) in changed {
+                c.settings.insert(k, v);
+            }
         }
-        if let Err(e) = c.save() {
+        if let Err(e) = crate::config::save_shared(&h.config) {
             log::warn!("saving config: {e}");
         }
     }
@@ -862,7 +900,7 @@ fn system_sensors(components: &sysinfo::Components) -> Vec<Sensor> {
 /// Value of a fan curve's input. `None` (missing, offline or stale source)
 /// makes the caller fail safe to full speed.
 fn curve_input(h: &Handle, own: &str, ch: &FanChannel, source: Option<&str>, local: &[Sensor]) -> Option<f64> {
-    let find = |list: &[Sensor], sid: &str| list.iter().find(|s| s.id == sid).map(|s| s.value);
+    let find = |list: &[Sensor], sid: &str| list.iter().find(|s| s.id == sid).map(|s| s.value).filter(|v| v.is_finite());
     let Some(src) = source else { return find(local, &ch.curve_sensor) };
     let (dev, sid) = split_source(src)?;
     if dev == own {
@@ -870,6 +908,11 @@ fn curve_input(h: &Handle, own: &str, ch: &FanChannel, source: Option<&str>, loc
     }
     let shared = h.shared.read();
     if dev == SYSTEM_SOURCE {
+        // The cache is refreshed every few seconds; an old one means the
+        // provider is stuck.
+        if shared.system_updated.is_none_or(|t| t.elapsed() > SYSTEM_SOURCE_MAX_AGE) {
+            return None;
+        }
         return find(&shared.system_sensors, sid);
     }
     let v = shared.devices.get(dev)?;
@@ -894,18 +937,7 @@ fn apply_fans(h: &Handle, dev: &mut dyn Device, ws: &mut WorkerState, cfg: &Conf
                 }
             }
         };
-        let needs = match ws.applied_fans.get(&ch.id) {
-            None => true,
-            Some((prev, at)) => {
-                let changed = match (prev, &target) {
-                    (FanTarget::Duty(a), FanTarget::Duty(b)) => a.abs_diff(*b) >= 2,
-                    (a, b) => a != b,
-                };
-                // Periodically re-assert, in case another program changed it.
-                changed || at.elapsed() > Duration::from_secs(30)
-            }
-        };
-        if needs {
+        if fan_needs_write(ws.applied_fans.get(&ch.id), target) {
             match dev.set_fan(&ch.id, target) {
                 Ok(()) => {
                     ws.applied_fans.insert(ch.id.clone(), (target, Instant::now()));
@@ -914,6 +946,19 @@ fn apply_fans(h: &Handle, dev: &mut dyn Device, ws: &mut WorkerState, cfg: &Conf
             }
         }
     }
+}
+
+/// Whether a fan target has to be (re)sent, given what was last applied.
+fn fan_needs_write(applied: Option<&(FanTarget, Instant)>, target: FanTarget) -> bool {
+    let Some((prev, at)) = applied else { return true };
+    let changed = match (prev, target) {
+        // Small duty changes are skipped, but full speed (the fail-safe)
+        // always goes through.
+        (FanTarget::Duty(a), FanTarget::Duty(b)) => *a != b && (a.abs_diff(b) >= 2 || b == 100),
+        (a, b) => *a != b,
+    };
+    // Periodically re-assert, in case another program changed it.
+    changed || at.elapsed() > Duration::from_secs(30)
 }
 
 // -------------------------------------------------------------------- RAM
@@ -995,5 +1040,170 @@ fn ram_config_changed(h: &Handle, workers: &mut Vec<Worker>, ram_scanned: &mut b
     };
     if changed {
         h.notify();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opendevicecontrol_core::{DeviceKind, Snapshot};
+
+    fn handle(config: Config) -> Handle {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        Handle {
+            config: Arc::new(RwLock::new(config)),
+            shared: Arc::new(RwLock::new(Shared {
+                started: Instant::now(),
+                devices: BTreeMap::new(),
+                conflicts: Vec::new(),
+                mqtt: MqttStatus::Disabled,
+                system_sensors: Vec::new(),
+                system_updated: None,
+                ram_status: None,
+                sensor_status: Vec::new(),
+            })),
+            cmd: tx,
+            listeners: Arc::new(Mutex::new(Vec::new())),
+            key_listeners: Arc::new(Mutex::new(Vec::new())),
+            quitting: Arc::new(AtomicBool::new(false)),
+            mqtt_done: Arc::new(AtomicBool::new(true)),
+            audio: crate::audio::Audio::default(),
+        }
+    }
+
+    /// A device whose sensor reads fail while fan writes still work.
+    struct FakeFan {
+        info: DeviceInfo,
+        written: Vec<FanTarget>,
+    }
+
+    impl FakeFan {
+        fn new() -> Self {
+            FakeFan {
+                info: DeviceInfo {
+                    id: "psu".into(),
+                    kind: DeviceKind::PowerSupply,
+                    manufacturer: "Test".into(),
+                    model: "Fake".into(),
+                    vendor_string: None,
+                    product_string: None,
+                    usb_vid: 0,
+                    usb_pid: 0,
+                    serial: None,
+                    firmware: None,
+                },
+                written: Vec::new(),
+            }
+        }
+    }
+
+    impl Device for FakeFan {
+        fn info(&self) -> &DeviceInfo {
+            &self.info
+        }
+        fn poll(&mut self) -> opendevicecontrol_core::Result<Snapshot> {
+            Err(opendevicecontrol_core::Error::NoReply { cmd: 0 })
+        }
+        fn set_control(&mut self, id: &str, _: &ControlValue) -> opendevicecontrol_core::Result<()> {
+            Err(opendevicecontrol_core::Error::UnknownControl(id.into()))
+        }
+        fn fan_channels(&self) -> Vec<FanChannel> {
+            vec![FanChannel { id: "fan".into(), name: "Fan".into(), min_duty: 30, curve_sensor: "temp".into() }]
+        }
+        fn set_fan(&mut self, _: &str, target: FanTarget) -> opendevicecontrol_core::Result<()> {
+            self.written.push(target);
+            Ok(())
+        }
+    }
+
+    fn temp(id: &str, v: f64) -> Sensor {
+        Sensor::new(id, id, SensorKind::Temperature, v)
+    }
+
+    fn worker_state() -> WorkerState {
+        WorkerState { applied_fans: HashMap::new(), last_sample: None, poll_failures: 0, light_failures: 0 }
+    }
+
+    #[test]
+    fn full_speed_skips_duty_hysteresis() {
+        let now = Instant::now();
+        assert!(fan_needs_write(None, FanTarget::Duty(40)));
+        assert!(!fan_needs_write(Some(&(FanTarget::Duty(40), now)), FanTarget::Duty(41)));
+        assert!(fan_needs_write(Some(&(FanTarget::Duty(40), now)), FanTarget::Duty(42)));
+        assert!(fan_needs_write(Some(&(FanTarget::Duty(99), now)), FanTarget::Duty(100)));
+        assert!(!fan_needs_write(Some(&(FanTarget::Duty(100), now)), FanTarget::Duty(100)));
+        assert!(fan_needs_write(Some(&(FanTarget::Duty(100), now)), FanTarget::Hardware));
+    }
+
+    #[test]
+    fn cooling_failsafe_is_bounded() {
+        let now = Instant::now();
+        assert!(cooling_failsafe_due(None, now));
+        assert!(!cooling_failsafe_due(Some(now), now + Duration::from_secs(2)));
+        assert!(cooling_failsafe_due(Some(now), now + COOLING_FAILSAFE_AFTER));
+    }
+
+    #[test]
+    fn failed_reads_drive_curves_to_full_speed() {
+        let mut cfg = Config::default();
+        cfg.set_fan_policy("psu", "fan", FanPolicy::Curve { points: vec![(30.0, 30), (60.0, 100)], source: None });
+        let h = handle(cfg.clone());
+        let mut dev = FakeFan::new();
+        let mut ws = worker_state();
+        apply_fans(&h, &mut dev, &mut ws, &cfg, &[temp("temp", 59.0)]);
+        assert_eq!(dev.written, vec![FanTarget::Duty(98)]);
+        // The read fails: no sensors, so the curve goes to full speed even
+        // though that is within the usual hysteresis.
+        apply_fans(&h, &mut dev, &mut ws, &cfg, &[]);
+        assert_eq!(dev.written.last(), Some(&FanTarget::Duty(100)));
+        apply_fans(&h, &mut dev, &mut ws, &cfg, &[temp("temp", 30.0)]);
+        assert_eq!(dev.written.last(), Some(&FanTarget::Duty(30)));
+        // A non-finite reading is no reading.
+        apply_fans(&h, &mut dev, &mut ws, &cfg, &[temp("temp", f64::NAN)]);
+        assert_eq!(dev.written.last(), Some(&FanTarget::Duty(100)));
+        // Recovery after a valid sample.
+        apply_fans(&h, &mut dev, &mut ws, &cfg, &[temp("temp", 30.0)]);
+        assert_eq!(dev.written.last(), Some(&FanTarget::Duty(30)));
+    }
+
+    #[test]
+    fn stale_system_temperature_is_not_used() {
+        let h = handle(Config::default());
+        let ch = FakeFan::new().fan_channels().remove(0);
+        let src = Some("system/cpu_temp");
+        assert_eq!(curve_input(&h, "psu", &ch, src, &[]), None, "never refreshed");
+        {
+            let mut sh = h.shared.write();
+            sh.system_sensors = vec![temp("cpu_temp", 45.0)];
+            sh.system_updated = Some(Instant::now());
+        }
+        assert_eq!(curve_input(&h, "psu", &ch, src, &[]), Some(45.0));
+        // The provider stalled: the old reading is not trusted.
+        let old = Instant::now().checked_sub(SYSTEM_SOURCE_MAX_AGE + Duration::from_secs(1));
+        if old.is_some() {
+            h.shared.write().system_updated = old;
+            assert_eq!(curve_input(&h, "psu", &ch, src, &[]), None);
+        }
+        {
+            let mut sh = h.shared.write();
+            sh.system_sensors = vec![temp("cpu_temp", f64::INFINITY)];
+            sh.system_updated = Some(Instant::now());
+        }
+        assert_eq!(curve_input(&h, "psu", &ch, src, &[]), None);
+    }
+
+    #[test]
+    fn lighting_and_polling_failures_count_separately() {
+        let h = handle(Config::default());
+        let mut ws = worker_state();
+        for _ in 0..LIGHT_FAIL_LIMIT - 1 {
+            assert!(!fail(&h, "psu", &mut ws.light_failures, LIGHT_FAIL_LIMIT, "frame"));
+        }
+        assert_eq!(ws.poll_failures, 0, "frame errors do not count as poll errors");
+        for _ in 0..POLL_FAIL_LIMIT - 1 {
+            assert!(!fail(&h, "psu", &mut ws.poll_failures, POLL_FAIL_LIMIT, "poll"));
+        }
+        assert!(fail(&h, "psu", &mut ws.poll_failures, POLL_FAIL_LIMIT, "poll"));
+        assert!(fail(&h, "psu", &mut ws.light_failures, LIGHT_FAIL_LIMIT, "frame"));
     }
 }
