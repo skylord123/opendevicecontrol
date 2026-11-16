@@ -12,6 +12,8 @@ pub enum DeviceKind {
     Cooler,
     FanHub,
     Memory,
+    /// A graphics card's own lighting (its sensors stay on This PC).
+    GraphicsCard,
     /// The computer OpenDeviceControl runs on (system stats and presence).
     Computer,
     Other,

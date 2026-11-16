@@ -204,6 +204,40 @@ pub fn dram_adapters() -> Vec<Adapter> {
     out
 }
 
+/// An i2c adapter of a graphics card, with the card's PCI identity.
+#[derive(Debug, Clone)]
+pub struct GpuAdapter {
+    pub number: u32,
+    pub name: String,
+    /// (vendor, device, subsystem vendor, subsystem device).
+    pub pci: (u16, u16, u16, u16),
+}
+
+/// The NVIDIA driver's i2c adapters named `name_prefix` (for example
+/// `NVIDIA i2c adapter 1 `, the port that carries RGB controllers).
+pub fn nvidia_adapters(name_prefix: &str) -> Vec<GpuAdapter> {
+    let mut out = Vec::new();
+    let Ok(dir) = std::fs::read_dir("/sys/bus/i2c/devices") else { return out };
+    for e in dir.flatten() {
+        let fname = e.file_name().to_string_lossy().to_string();
+        let Some(number) = fname.strip_prefix("i2c-").and_then(|n| n.parse::<u32>().ok()) else { continue };
+        let name = read_trim(&e.path().join("name")).unwrap_or_default();
+        if !name.starts_with(name_prefix) {
+            continue;
+        }
+        // The adapter sits right under the graphics card's PCI function.
+        let Some(dev) = std::fs::canonicalize(e.path()).ok().and_then(|p| p.parent().map(Path::to_path_buf)) else { continue };
+        let ids = (read_hex(&dev.join("vendor")), read_hex(&dev.join("device")), read_hex(&dev.join("subsystem_vendor")), read_hex(&dev.join("subsystem_device")));
+        if let (Some(v), Some(d), Some(sv), Some(sd)) = ids {
+            if v == 0x10de {
+                out.push(GpuAdapter { number, name, pci: (v, d, sv, sd) });
+            }
+        }
+    }
+    out.sort_by_key(|a| a.number);
+    out
+}
+
 pub fn open_dram_buses() -> Result<Vec<Box<dyn SmBus>>> {
     let adapters = dram_adapters();
     if adapters.is_empty() {

@@ -48,6 +48,7 @@ pub fn device_hardware(kind: DeviceKind) -> HardwareKind {
         DeviceKind::PowerSupply => HardwareKind::PowerSupply,
         DeviceKind::Cooler | DeviceKind::FanHub => HardwareKind::Cooler,
         DeviceKind::Memory => HardwareKind::Memory,
+        DeviceKind::GraphicsCard => HardwareKind::Gpu,
         DeviceKind::Computer => HardwareKind::Computer,
         _ => HardwareKind::Other,
     }
