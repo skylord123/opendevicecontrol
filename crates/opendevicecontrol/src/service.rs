@@ -740,6 +740,16 @@ fn worker(h: Handle, state: Arc<Mutex<State>>, mut dev: Box<dyn Device>, rx: Rec
     let mut next_poll = Instant::now();
     let mut next_frame = Instant::now();
     let mut lighting = h.config.read().lighting(&id);
+    let mut overrides = crate::lighting::overrides(&h.config.read(), &id, &zones);
+    // Synced devices run the shared effect across the PC layout.
+    let canvas_of = |zones: &[LightZone], layout: &[opendevicecontrol_core::LedShape]| {
+        let cfg = h.config.read();
+        if cfg.synced(&id) { crate::layout::canvas_positions(&cfg, &id, zones, layout) } else { None }
+    };
+    let mut canvas = canvas_of(&zones, &layout);
+    // What the running effects remember between frames.
+    let mut fx = crate::fx::FxState::default();
+    let mut fx_overrides: Vec<crate::fx::FxState> = Vec::new();
 
     loop {
         // Sleep until the next thing is due, waking early for commands.
@@ -770,8 +780,10 @@ fn worker(h: Handle, state: Arc<Mutex<State>>, mut dev: Box<dyn Device>, rx: Rec
                 let same = z.len() == zones.len() && z.iter().zip(&zones).all(|(a, b)| a.id == b.id && a.leds == b.leds);
                 if !same {
                     zones = z;
+                    overrides = crate::lighting::overrides(&h.config.read(), &id, &zones);
                     next_frame = Instant::now();
                 }
+                canvas = canvas_of(&zones, &dev.led_layout());
                 if let Some(v) = h.shared.write().devices.get_mut(&id) {
                     v.zones = zones.clone();
                     layout = dev.led_layout();
@@ -793,6 +805,8 @@ fn worker(h: Handle, state: Arc<Mutex<State>>, mut dev: Box<dyn Device>, rx: Rec
             Ok(WorkerCmd::ConfigChanged) => {
                 ws.applied_fans.clear();
                 lighting = h.config.read().lighting(&id);
+                overrides = crate::lighting::overrides(&h.config.read(), &id, &zones);
+                canvas = canvas_of(&zones, &layout);
                 next_frame = Instant::now();
                 next_poll = next_poll.min(Instant::now() + Duration::from_millis(50));
                 continue;
@@ -816,7 +830,7 @@ fn worker(h: Handle, state: Arc<Mutex<State>>, mut dev: Box<dyn Device>, rx: Rec
                 if pressed && key == opendevicecontrol_core::devices::nxp::KEY_BRIGHTNESS && !zones.is_empty() {
                     let b = crate::lighting::next_brightness(lighting.brightness);
                     h.update_config(|c| {
-                        let l = c.lighting.entry(id.clone()).or_default();
+                        let l = c.lighting_mut(&id);
                         l.brightness = b;
                         l.on = true;
                     });
@@ -837,11 +851,20 @@ fn worker(h: Handle, state: Arc<Mutex<State>>, mut dev: Box<dyn Device>, rx: Rec
             // them at its own pace, each with the sound's peak since the last.
             let pace = dev.frame_interval().filter(|&p| p > FRAME);
             let frame = preview.unwrap_or_else(|| {
-                let audio = (lighting.on && lighting.effect.is_sound()).then(|| match pace {
+                let sound = |l: &crate::config::Lighting| l.on && l.effect.is_sound();
+                let audio = (sound(&lighting) || overrides.iter().any(|(_, l)| sound(l))).then(|| match pace {
                     Some(p) => h.audio.frame_peak(p),
                     None => h.audio.frame(),
                 });
-                crate::lighting::render(&lighting, &zones, &layout, t, audio.as_ref())
+                let mut f = match &canvas {
+                    Some(pos) => {
+                        let at = crate::lighting::Placed { pos, bars: true, centre: Some(crate::layout::CENTRE_Y) };
+                        crate::lighting::render_at(&lighting, &zones, &at, t, audio.as_ref(), &mut fx)
+                    }
+                    None => crate::lighting::render_with(&lighting, &zones, &layout, t, audio.as_ref(), &mut fx),
+                };
+                crate::lighting::apply_overrides(&mut f, &overrides, t, audio.as_ref(), &mut fx_overrides);
+                f
             });
             match if own { Ok(()) } else { dev.set_lights(&frame) } {
                 Ok(()) => {
@@ -874,7 +897,7 @@ fn worker(h: Handle, state: Arc<Mutex<State>>, mut dev: Box<dyn Device>, rx: Rec
             next_frame = now
                 + if own {
                     FRAME
-                } else if crate::lighting::is_animated(&lighting) {
+                } else if crate::lighting::is_animated(&lighting) || overrides.iter().any(|(_, l)| crate::lighting::is_animated(l)) {
                     pace.unwrap_or(FRAME)
                 } else {
                     Duration::from_millis(500)

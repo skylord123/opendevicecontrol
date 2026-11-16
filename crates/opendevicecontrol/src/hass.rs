@@ -581,7 +581,7 @@ impl<'a> Session<'a> {
             // JSON schema light: {"state":"ON","brightness":0-100,"color":{r,g,b},"effect":".."}
             let Ok(v) = serde_json::from_str::<Value>(text) else { return };
             self.h.update_config(|c| {
-                let l = c.lighting.entry(dev.to_string()).or_default();
+                let l = c.lighting_mut(dev);
                 if let Some(s) = v.get("state").and_then(Value::as_str) {
                     l.on = s.eq_ignore_ascii_case("ON");
                 }

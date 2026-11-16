@@ -8,12 +8,18 @@ use crate::service::{Command, DeviceView};
 use eframe::egui::{self, Color32, RichText};
 use opendevicecontrol_core::devices::{HW_LIGHTING_PREFIX, SOFTWARE_LIGHTING};
 use opendevicecontrol_core::{Control, ControlKind, ControlValue, LedShape, LightZone, Rgb};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 /// Draw a device's LEDs where they physically sit (e.g. a keyboard's keys),
 /// each filled with its live colour, scaled to the available width.
 fn draw_layout(ui: &mut egui::Ui, shapes: &[LedShape], lights: &[Rgb]) {
+    draw_layout_sized(ui, shapes, lights, 900.0);
+    ui.label(RichText::new("live preview").small().weak());
+}
+
+/// [`draw_layout`] at most `max_width` wide, without the caption.
+pub(crate) fn draw_layout_sized(ui: &mut egui::Ui, shapes: &[LedShape], lights: &[Rgb], max_width: f32) {
     let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
     for s in shapes {
         let [x, y, w, h] = s.rect;
@@ -21,7 +27,8 @@ fn draw_layout(ui: &mut egui::Ui, shapes: &[LedShape], lights: &[Rgb]) {
     }
     let (bw, bh) = ((x1 - x0).max(1.0), (y1 - y0).max(1.0));
     let pad = 10.0;
-    let width = ui.available_width().min(900.0);
+    let width = ui.available_width().min(max_width);
+    let pad = if max_width < 500.0 { 4.0 } else { pad };
     let scale = ((width - 2.0 * pad) / bw).max(0.1);
     let size = egui::vec2(bw * scale + 2.0 * pad, bh * scale + 2.0 * pad);
     let (area, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
@@ -54,7 +61,6 @@ fn draw_layout(ui: &mut egui::Ui, shapes: &[LedShape], lights: &[Rgb]) {
     if let Some((s, c)) = hovered {
         resp.on_hover_text(format!("{} {}", s.name, c.to_hex()));
     }
-    ui.label(RichText::new("live preview").small().weak());
 }
 
 /// The device page's tabs.
@@ -230,10 +236,12 @@ impl FerroApp {
     /// Controls named "Part: setting" (a lighting zone, a fan header...)
     /// get a box per part, side by side when there is room; the rest are
     /// listed first.
-    fn grouped_controls(&self, ui: &mut egui::Ui, dev: &str, controls: &[&Control], aliases: &HashMap<String, String>) {
+    /// `hidden`: parts (zone names) whose box is left out.
+    fn grouped_controls(&self, ui: &mut egui::Ui, dev: &str, controls: &[&Control], aliases: &HashMap<String, String>, hidden: &HashSet<String>) {
         let mut groups: Vec<(&str, Vec<(&Control, &str)>)> = Vec::new();
         for c in controls {
             match c.name.split_once(": ") {
+                Some((part, _)) if hidden.contains(part) => {}
                 Some((part, label)) => match groups.iter_mut().find(|g| g.0 == part) {
                     Some(g) => g.1.push((c, label)),
                     None => groups.push((part, vec![(c, label)])),
@@ -268,6 +276,23 @@ impl FerroApp {
         }
     }
 
+    /// The device's names of the zones hidden on its page.
+    fn hidden_zones(&self, dev: &str, zones: &[LightZone]) -> HashSet<String> {
+        let cfg = self.h.config.read();
+        zones.iter().filter(|z| cfg.hidden_zones.contains(&format!("{dev}/{}", z.id))).map(|z| z.name.clone()).collect()
+    }
+
+    fn set_zone_hidden(&self, dev: &str, z: &LightZone, hide: bool) {
+        let key = format!("{dev}/{}", z.id);
+        self.h.update_config(|c| {
+            if hide {
+                c.hidden_zones.insert(key);
+            } else {
+                c.hidden_zones.remove(&key);
+            }
+        });
+    }
+
     /// The names the user gave this device's zones: driver name → name.
     fn zone_aliases(&self, dev: &str, zones: &[LightZone]) -> HashMap<String, String> {
         let cfg = self.h.config.read();
@@ -287,6 +312,9 @@ impl FerroApp {
             if ui.small_button("✏").on_hover_text("Rename this zone").clicked() {
                 let st = Rename { key: format!("{dev}/{}", z.id), device_name: z.name.clone(), text: name.to_string(), focus: true };
                 ui.data_mut(|m| m.insert_temp(rename_id(), st));
+            }
+            if ui.small_button("Hide").on_hover_text("Nothing is connected here: hide this zone").clicked() {
+                self.set_zone_hidden(dev, z, true);
             }
         });
     }
@@ -483,6 +511,136 @@ impl FerroApp {
         }
     }
 
+    /// The effect list and its settings (colours, speed...), for the plain
+    /// or the sound-reactive effects. `aliases`: zone names the user gave.
+    pub(crate) fn effect_editor(&self, ui: &mut egui::Ui, l: &mut Lighting, sound: bool, zones: &[LightZone], aliases: &HashMap<String, String>) {
+        let names = if sound { Effect::SOUND_NAMES } else { Effect::LIGHT_NAMES };
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut l.on, "On");
+            ui.separator();
+            ui.label("Effect");
+            let mut picked = None;
+            egui::ComboBox::from_id_salt(("effect", sound)).width(170.0).height(420.0).selected_text(l.effect.name()).show_ui(ui, |ui| {
+                let mut notes_heading = false;
+                for name in names {
+                    let e = l.effect.switch_to(name);
+                    // Sound effects: the ones by musical note get their own group.
+                    if sound && !notes_heading && e.as_ref().is_some_and(|e| e.is_note_effect()) {
+                        notes_heading = true;
+                        ui.separator();
+                        ui.label(RichText::new("By musical note").small().weak());
+                    }
+                    if ui.selectable_label(l.effect.name() == *name, *name).clicked() {
+                        picked = e;
+                    }
+                }
+            });
+            if let Some(e) = picked {
+                l.effect = e;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Brightness");
+            ui.add(egui::Slider::new(&mut l.brightness, 0..=100).suffix(" %"));
+        });
+                match &mut l.effect {
+            Effect::Static { colors } => {
+                let mut per_zone = colors.len() > 1;
+                if zones.len() > 1 && ui.checkbox(&mut per_zone, "Different colour per zone").changed() {
+                    let first = colors.first().copied().unwrap_or_default();
+                    *colors = if per_zone { vec![first; zones.len()] } else { vec![first] };
+                }
+                ui.horizontal_wrapped(|ui| {
+                    if per_zone {
+                        colors.resize(zones.len(), colors.last().copied().unwrap_or_default());
+                        for (z, c) in zones.iter().zip(colors.iter_mut()) {
+                            ui.label(aliases.get(&z.name).unwrap_or(&z.name));
+                            color_button(ui, c);
+                            ui.add_space(8.0);
+                        }
+                    } else {
+                        if colors.is_empty() {
+                            colors.push(HexColor::default());
+                        }
+                        ui.label("Colour");
+                        color_button(ui, &mut colors[0]);
+                    }
+                });
+            }
+            Effect::Breathing { color, speed } => {
+                ui.horizontal(|ui| {
+                    ui.label("Colour");
+                    color_button(ui, color);
+                    ui.add_space(12.0);
+                    ui.label("Speed");
+                    ui.add(egui::Slider::new(speed, 0.1..=4.0).fixed_decimals(1));
+                });
+            }
+            Effect::ColorCycle { speed } | Effect::RainbowWave { speed } => {
+                ui.horizontal(|ui| {
+                    ui.label("Speed");
+                    ui.add(egui::Slider::new(speed, 0.1..=4.0).fixed_decimals(1));
+                });
+            }
+            Effect::ColorWave { color, color2, speed } => {
+                ui.horizontal(|ui| {
+                    ui.label("Colours");
+                    color_button(ui, color);
+                    color_button(ui, color2);
+                    ui.add_space(12.0);
+                    ui.label("Speed");
+                    ui.add(egui::Slider::new(speed, 0.1..=4.0).fixed_decimals(1));
+                });
+            }
+            Effect::Pacifica { speed } | Effect::Twinkle { speed } => {
+                ui.horizontal(|ui| {
+                    ui.label("Speed");
+                    ui.add(egui::Slider::new(speed, 0.1..=4.0).fixed_decimals(1));
+                });
+            }
+            Effect::Meteor { color, speed } => {
+                ui.horizontal(|ui| {
+                    ui.label("Colour");
+                    color_button(ui, color);
+                    ui.add_space(12.0);
+                    ui.label("Speed");
+                    ui.add(egui::Slider::new(speed, 0.1..=4.0).fixed_decimals(1));
+                });
+            }
+            e => {
+                let note_effect = e.is_note_effect();
+                if let Some(st) = e.sound_style_mut() {
+                    ui.horizontal_wrapped(|ui| {
+                        if note_effect {
+                            ui.label(RichText::new("Colours from the notes being played").weak())
+                                .on_hover_text("Each note has its colour: A yellow, C# red, F blue, and the rest in between (after ColorChord).");
+                        } else {
+                            ui.label("Colours");
+                            // (rainbow, notes)
+                            let mut pick = (st.rainbow && !st.notes, st.notes);
+                            let was = pick;
+                            ui.selectable_value(&mut pick, (true, false), "Rainbow");
+                            ui.selectable_value(&mut pick, (false, false), "Custom");
+                            ui.selectable_value(&mut pick, (false, true), "Notes")
+                                .on_hover_text("Colours from the notes being played: A yellow, C# red, F blue, and the rest in between.");
+                            if pick != was {
+                                st.notes = pick.1;
+                                st.rainbow = pick.0 || (pick.1 && st.rainbow);
+                            }
+                            if !st.rainbow && !st.notes {
+                                color_button(ui, &mut st.color);
+                                color_button(ui, &mut st.color2);
+                            }
+                        }
+                        ui.add_space(12.0);
+                        ui.label("Sensitivity");
+                        ui.add(egui::Slider::new(&mut st.sensitivity, 0.25..=4.0).logarithmic(true).fixed_decimals(2));
+                    });
+                }
+            }
+        }
+    }
+
     pub(crate) fn peripheral_page(&mut self, ui: &mut egui::Ui, d: &DeviceView) {
         let dev = d.info.id.clone();
         self.rename_dialog(ui.ctx());
@@ -587,6 +745,19 @@ impl FerroApp {
             // ---- lighting ----
             if !d.zones.is_empty() {
                 let aliases = self.zone_aliases(&dev, &d.zones);
+                let hidden = self.hidden_zones(&dev, &d.zones);
+                // Channels that get a box of their own under the effect:
+                // devices with several zones and no drawn layout.
+                let channels: Vec<(LightZone, String)> = if d.led_layout.is_empty() && d.zones.len() > 1 {
+                    d.zones
+                        .iter()
+                        .filter(|z| !hidden.contains(&z.name))
+                        .map(|z| (z.clone(), aliases.get(&z.name).cloned().unwrap_or_else(|| z.name.clone())))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let mut go_lighting = false;
                 let mut l = self.h.config.read().lighting(&dev);
                 let before = l.clone();
                 section(ui, "Lighting", |ui| {
@@ -602,10 +773,22 @@ impl FerroApp {
                         let multi = d.zones.len() > 1;
                         let mut i = 0;
                         for z in &d.zones {
+                            if hidden.contains(&z.name) {
+                                i += z.leds;
+                                continue;
+                            }
                             let name = aliases.get(&z.name).cloned().unwrap_or_else(|| z.name.clone());
                             ui.horizontal(|ui| {
                                 if multi {
                                     self.zone_label(ui, &dev, z, &name);
+                                }
+                                let pieces = self.h.config.read().pieces(&dev, &z.id);
+                                if !pieces.is_empty() {
+                                    // Described: drawn as its fans and strips.
+                                    let end = (i + z.leds).min(d.lights.len());
+                                    crate::gui_layout::draw_pieces(ui, &pieces, d.lights.get(i..end).unwrap_or(&[]));
+                                    i += z.leds;
+                                    return;
                                 }
                                 let many = z.leds > 16;
                                 let (swatch, round) = if many { (egui::vec2(12.0, 12.0), 2.0) } else { (egui::vec2(40.0, 22.0), 5.0) };
@@ -624,9 +807,35 @@ impl FerroApp {
                                 });
                             });
                         }
-                        ui.label(RichText::new("live preview").small().weak());
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new("live preview").small().weak());
+                            for z in d.zones.iter().filter(|z| hidden.contains(&z.name)) {
+                                ui.separator();
+                                let name = aliases.get(&z.name).unwrap_or(&z.name);
+                                ui.label(RichText::new(format!("{name} hidden")).small().weak());
+                                if ui.small_button("Show").clicked() {
+                                    self.set_zone_hidden(&dev, z, false);
+                                }
+                            }
+                        });
                     }
                     ui.add_space(6.0);
+                    // Synced on the Lighting page: the shared effect runs here.
+                    if self.h.config.read().synced(&dev) {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new("🔗 Synced: this device runs the shared effect from the Lighting page.").color(ACCENT));
+                            if ui.button("Open Lighting page").clicked() {
+                                go_lighting = true;
+                            }
+                            if ui.button("Use its own effect").on_hover_text("Stop syncing this device").clicked() {
+                                self.set_synced(d, false);
+                            }
+                        });
+                        if !channels.is_empty() {
+                            self.channel_effects(ui, &dev, &channels);
+                        }
+                        return;
+                    }
                     // Where the lighting comes from: OpenDeviceControl's effects, its
                     // sound-reactive effects, or the device's own effects.
                     let sw = d.controls.iter().find(|c| c.id == SOFTWARE_LIGHTING);
@@ -688,8 +897,18 @@ impl FerroApp {
                             let _ = self.h.cmd.send(Command::PreviewKey { device: dev.clone(), key: key.into() });
                         }
                         ui.ctx().request_repaint_after(Duration::from_millis(33));
+                        if !channels.is_empty() {
+                            ui.label(
+                                RichText::new(
+                                    "Built-in effects are set per channel. To give fans or strips on one channel effects of \
+                                     their own, use OpenDeviceControl effects or Sound reactive.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                        }
                         let hw: Vec<&Control> = d.controls.iter().filter(|c| c.id.starts_with(HW_LIGHTING_PREFIX)).collect();
-                        self.grouped_controls(ui, &dev, &hw, &aliases);
+                        self.grouped_controls(ui, &dev, &hw, &aliases, &hidden);
                         return;
                     }
                     if picked == Mode::Sound {
@@ -702,88 +921,9 @@ impl FerroApp {
                         // Keep the preview moving with the music.
                         ui.ctx().request_repaint_after(Duration::from_millis(50));
                     }
-                    let names = if picked == Mode::Sound { Effect::SOUND_NAMES } else { Effect::LIGHT_NAMES };
-                    ui.horizontal_wrapped(|ui| {
-                        ui.checkbox(&mut l.on, "On");
-                        ui.separator();
-                        for name in names {
-                            if ui.selectable_label(l.effect.name() == *name, *name).clicked() {
-                                if let Some(e) = l.effect.switch_to(name) {
-                                    l.effect = e;
-                                }
-                            }
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Brightness");
-                        ui.add(egui::Slider::new(&mut l.brightness, 0..=100).suffix(" %"));
-                    });
-                    let zones = &d.zones;
-                    match &mut l.effect {
-                        Effect::Static { colors } => {
-                            let mut per_zone = colors.len() > 1;
-                            if zones.len() > 1 && ui.checkbox(&mut per_zone, "Different colour per zone").changed() {
-                                let first = colors.first().copied().unwrap_or_default();
-                                *colors = if per_zone { vec![first; zones.len()] } else { vec![first] };
-                            }
-                            ui.horizontal_wrapped(|ui| {
-                                if per_zone {
-                                    colors.resize(zones.len(), colors.last().copied().unwrap_or_default());
-                                    for (z, c) in zones.iter().zip(colors.iter_mut()) {
-                                        ui.label(aliases.get(&z.name).unwrap_or(&z.name));
-                                        color_button(ui, c);
-                                        ui.add_space(8.0);
-                                    }
-                                } else {
-                                    if colors.is_empty() {
-                                        colors.push(HexColor::default());
-                                    }
-                                    ui.label("Colour");
-                                    color_button(ui, &mut colors[0]);
-                                }
-                            });
-                        }
-                        Effect::Breathing { color, speed } => {
-                            ui.horizontal(|ui| {
-                                ui.label("Colour");
-                                color_button(ui, color);
-                                ui.add_space(12.0);
-                                ui.label("Speed");
-                                ui.add(egui::Slider::new(speed, 0.1..=4.0).fixed_decimals(1));
-                            });
-                        }
-                        Effect::ColorCycle { speed } | Effect::RainbowWave { speed } => {
-                            ui.horizontal(|ui| {
-                                ui.label("Speed");
-                                ui.add(egui::Slider::new(speed, 0.1..=4.0).fixed_decimals(1));
-                            });
-                        }
-                        Effect::ColorWave { color, color2, speed } => {
-                            ui.horizontal(|ui| {
-                                ui.label("Colours");
-                                color_button(ui, color);
-                                color_button(ui, color2);
-                                ui.add_space(12.0);
-                                ui.label("Speed");
-                                ui.add(egui::Slider::new(speed, 0.1..=4.0).fixed_decimals(1));
-                            });
-                        }
-                        e => {
-                            if let Some(st) = e.sound_style_mut() {
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.label("Colours");
-                                    ui.selectable_value(&mut st.rainbow, true, "Rainbow");
-                                    ui.selectable_value(&mut st.rainbow, false, "Custom");
-                                    if !st.rainbow {
-                                        color_button(ui, &mut st.color);
-                                        color_button(ui, &mut st.color2);
-                                    }
-                                    ui.add_space(12.0);
-                                    ui.label("Sensitivity");
-                                    ui.add(egui::Slider::new(&mut st.sensitivity, 0.25..=4.0).logarithmic(true).fixed_decimals(2));
-                                });
-                            }
-                        }
+                    self.effect_editor(ui, &mut l, picked == Mode::Sound, &d.zones, &aliases);
+                    if !channels.is_empty() {
+                        self.channel_effects(ui, &dev, &channels);
                     }
                     if d.keys.iter().any(|k| k.id == opendevicecontrol_core::devices::nxp::KEY_BRIGHTNESS) {
                         ui.label(
@@ -793,6 +933,32 @@ impl FerroApp {
                         );
                     }
                 });
+                // What's plugged into each zone, for devices whose LEDs
+                // aren't laid out by the driver (headers with fans, strips).
+                if d.led_layout.is_empty() && d.zones.iter().any(|z| z.leds > 1) {
+                    ui.add_space(6.0);
+                    section(ui, "What's plugged in", |ui| {
+                        ui.label(
+                            RichText::new(
+                                "Describe the fans and strips on each zone and which of its LEDs they use. \
+                                 Fans on a splitter that all light alike are one fan with several copies.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                        ui.add_space(4.0);
+                        for (k, z) in d.zones.iter().filter(|z| z.leds > 1 && !hidden.contains(&z.name)).enumerate() {
+                            if k > 0 {
+                                ui.separator();
+                            }
+                            let name = aliases.get(&z.name).cloned().unwrap_or_else(|| z.name.clone());
+                            self.pieces_editor(ui, &dev, z, &name);
+                        }
+                    });
+                }
+                if go_lighting {
+                    self.open_lighting_page();
+                }
                 if l != before {
                     self.set_lighting(ui, &dev, l);
                 } else if !ui.input(|i| i.pointer.any_down()) && self.h.config.read().lighting.get(&dev) != Some(&l) {
@@ -908,7 +1074,7 @@ impl FerroApp {
         // shown with the lighting) ----
         if show(Tab::Settings) && !settings.is_empty() {
             section(ui, "Settings", |ui| {
-                self.grouped_controls(ui, &dev, &settings, &self.zone_aliases(&dev, &d.zones));
+                self.grouped_controls(ui, &dev, &settings, &self.zone_aliases(&dev, &d.zones), &self.hidden_zones(&dev, &d.zones));
             });
             ui.add_space(6.0);
         }

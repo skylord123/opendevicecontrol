@@ -163,9 +163,9 @@ controller should work too.
 ## Sound-reactive lighting
 
 Every device with lighting can follow what the computer is playing (the
-*Sound reactive* tab of its lighting section): Spectrum, Beat pulse, Ripple,
-Sound stream, Rain, Level meter, Radar and Level colour, with rainbow or
-custom colours and a sensitivity. OpenDeviceControl listens to the default
+*Sound reactive* tab of its lighting section), with rainbow, custom or
+note colours and a sensitivity; see [lighting.md](lighting.md) for the
+effects. OpenDeviceControl listens to the default
 output device (WASAPI loopback on Windows, the PulseAudio/PipeWire monitor on
 Linux), records nothing, and only captures while a sound effect is shown.
 

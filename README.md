@@ -16,8 +16,12 @@ it to Home Assistant. Nothing did all of that, so I wrote OpenDeviceControl.
 
 - **Sensors like HWMonitor:** CPU, GPU, motherboard, memory, drives, network,
   batteries, with current, min and max values and graphs. See [docs/sensors.md](docs/sensors.md).
-- **Device control:** fan curves, lighting (including sound-reactive effects),
-  key remapping, macros, G-keys, DPI and more, depending on the device.
+- **Device control:** fan curves, lighting, key remapping, macros, G-keys,
+  DPI and more, depending on the device.
+- **Lighting across the whole PC:** sync devices to one effect, lay out your
+  fans and strips like they sit in the case, and pick from over 25 effects,
+  many reacting to the music (including the notes being played). See
+  [docs/lighting.md](docs/lighting.md).
 - **Home Assistant:** devices and entities appear automatically over MQTT,
   with two-way control. See [docs/home-assistant.md](docs/home-assistant.md).
 - **Runs in the background:** tray icon, starts at login, about 30 MB of RAM

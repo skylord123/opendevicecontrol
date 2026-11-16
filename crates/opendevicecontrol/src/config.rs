@@ -170,6 +170,119 @@ pub struct Config {
     /// (e.g. "Rear case fan" for a header the board calls "Audio").
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub zone_names: BTreeMap<String, String>,
+    /// What is plugged into a lighting zone, per `"<device id>/<zone id>"`:
+    /// fans and strips in the order their LEDs are chained.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub zone_pieces: BTreeMap<String, Vec<Piece>>,
+    /// The Lighting page: one effect shared by the devices ticked there.
+    pub lighting_sync: LightingSync,
+    /// Lighting zones with nothing connected, hidden from the pages, as
+    /// `"<device id>/<zone id>"`.
+    #[serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub hidden_zones: std::collections::BTreeSet<String>,
+    /// Where each item sits on the PC layout (the Lighting page), by item
+    /// key (see `crate::layout`).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub layout_places: BTreeMap<String, Place>,
+    /// Zones and pieces with an effect of their own, over the device's (or
+    /// the shared) effect: `"<device id>/<zone id>"` for a zone,
+    /// `"<device id>/<zone id>/<start LED>"` for a fan or strip on it.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub zone_lighting: BTreeMap<String, Lighting>,
+}
+
+/// Devices that follow one shared effect (the Lighting page) instead of
+/// their own.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LightingSync {
+    pub devices: std::collections::BTreeSet<String>,
+    pub lighting: Lighting,
+}
+
+/// What kind of thing a run of LEDs is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PieceKind {
+    /// LEDs evenly spaced around a ring.
+    #[default]
+    Fan,
+    /// LEDs in a line.
+    Strip,
+    /// Anything else (a block, a logo...).
+    Other,
+}
+
+impl PieceKind {
+    pub const ALL: [PieceKind; 3] = [PieceKind::Fan, PieceKind::Strip, PieceKind::Other];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            PieceKind::Fan => "Fan",
+            PieceKind::Strip => "Strip",
+            PieceKind::Other => "Other",
+        }
+    }
+}
+
+/// One fan, strip or other item on a lighting zone: `leds` LEDs of the
+/// chain from `start`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Piece {
+    pub name: String,
+    pub kind: PieceKind,
+    /// The piece's first LED on the zone (0 = the zone's first).
+    pub start: usize,
+    pub leds: usize,
+    /// How many physical items show these same LEDs (fans on a splitter
+    /// all light alike).
+    pub copies: usize,
+    /// The LEDs run the other way: counter-clockwise on a fan, right to
+    /// left on a strip.
+    pub reverse: bool,
+}
+
+impl Default for Piece {
+    fn default() -> Self {
+        Piece { name: String::new(), kind: PieceKind::Fan, start: 0, leds: 8, copies: 1, reverse: false }
+    }
+}
+
+/// Where an item sits on the PC layout: its centre, size and turn, in
+/// layout units (the layout is [`crate::layout::WIDTH`] wide).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Place {
+    pub x: f32,
+    pub y: f32,
+    /// Fan diameter, strip length or block width, in layout units.
+    pub size: f32,
+    /// Degrees clockwise. On a fan: where LED 1 sits (0 = top).
+    pub rotation: f32,
+}
+
+impl Default for Place {
+    fn default() -> Self {
+        Place { x: 0.0, y: 0.0, size: 120.0, rotation: 0.0 }
+    }
+}
+
+impl Config {
+    /// The pieces on a zone (empty: not described), by start LED.
+    pub fn pieces(&self, device: &str, zone: &str) -> Vec<Piece> {
+        let mut v = self.zone_pieces.get(&format!("{device}/{zone}")).cloned().unwrap_or_default();
+        // Pieces saved before they had a start were chained in list order.
+        if v.len() > 1 && v.iter().all(|p| p.start == 0) {
+            let mut next = 0;
+            for p in &mut v {
+                p.start = next;
+                next += p.leds;
+            }
+        }
+        v.sort_by_key(|p| p.start);
+        v
+    }
 }
 
 /// Where This PC gets temperatures on Windows besides the OS (which has
@@ -220,6 +333,12 @@ pub enum Effect {
     RainbowWave { speed: f32 },
     /// Two colours sweeping across the device.
     ColorWave { color: HexColor, color2: HexColor, speed: f32 },
+    /// Gentle ocean waves with whitecaps (after FastLED's Pacifica).
+    Pacifica { speed: f32 },
+    /// Fairy lights: LEDs fading in and out on their own.
+    Twinkle { speed: f32 },
+    /// A comet with a sparkling tail, round fans and along strips.
+    Meteor { color: HexColor, speed: f32 },
     // ---- sound-reactive (what the computer is playing) ----
     /// Frequency bars, bass on the left (bars rise on keyboards).
     Spectrum(SoundStyle),
@@ -237,6 +356,34 @@ pub enum Effect {
     Radar(SoundStyle),
     /// The whole device in one colour picked by the loudness.
     LevelColor(SoundStyle),
+    // ---- by musical note (after ColorChord) ----
+    /// Each note gets a run of LEDs in its colour, sized by its loudness.
+    Notes(SoundStyle),
+    /// Scattered LEDs, each owned by a note, that keep their place.
+    NoteCells(SoundStyle),
+    /// Notes around the edge claim the area nearest them, louder ones more.
+    NoteFields(SoundStyle),
+    /// Everything in the colour of the loudest note.
+    MainNote(SoundStyle),
+    // ---- more sound-reactive effects ----
+    /// Flames up strips and fan rings, flaring with the bass and beats.
+    AudioFire(SoundStyle),
+    /// A level meter from the middle out, with a peak marker that falls back.
+    GravityMeter(SoundStyle),
+    /// Each direction is a frequency band, swelling as it plays.
+    FrequencyStar(SoundStyle),
+    /// Rings pop out where a band jumps, coloured by band.
+    SpectrumBubbles(SoundStyle),
+    /// The pitch being played as a colour flowing outward.
+    PitchStream(SoundStyle),
+    /// Bass red, mids green, highs blue, flowing outward from the middle.
+    DjLight(SoundStyle),
+    /// Soft dots wandering about, each glowing with its band.
+    NoiseMove(SoundStyle),
+    /// Slow plasma waves; only crests under the loudness show.
+    AudioPlasma(SoundStyle),
+    /// Bands across, time scrolling down.
+    Spectrogram(SoundStyle),
 }
 
 /// Colours and sensitivity shared by the sound-reactive effects.
@@ -249,6 +396,8 @@ pub struct SoundStyle {
     pub color2: HexColor,
     /// Gain applied to the sound levels (0.25–4; 1 = automatic level).
     pub sensitivity: f32,
+    /// Colours from the notes being played (overrides `rainbow`).
+    pub notes: bool,
 }
 
 impl Default for SoundStyle {
@@ -258,6 +407,7 @@ impl Default for SoundStyle {
             color: HexColor(opendevicecontrol_core::Rgb::new(0, 200, 255)),
             color2: HexColor(opendevicecontrol_core::Rgb::new(255, 0, 120)),
             sensitivity: 1.0,
+            notes: false,
         }
     }
 }
@@ -272,12 +422,15 @@ impl SoundStyle {
 
 impl Effect {
     /// Every effect (Home Assistant's effect list).
-    pub const NAMES: [&'static str; 13] = [
+    pub const NAMES: &'static [&'static str] = &[
         "Static",
         "Breathing",
         "Color cycle",
         "Rainbow wave",
         "Color wave",
+        "Pacifica",
+        "Twinkle",
+        "Meteor",
         "Spectrum",
         "Beat pulse",
         "Ripple",
@@ -286,12 +439,52 @@ impl Effect {
         "Level meter",
         "Radar",
         "Level colour",
+        "Notes",
+        "Note cells",
+        "Note fields",
+        "Main note",
+        "Audio fire",
+        "Gravity meter",
+        "Frequency star",
+        "Spectrum bubbles",
+        "Pitch stream",
+        "DJ light",
+        "Noise move",
+        "Audio plasma",
+        "Spectrogram",
     ];
     /// The plain (not sound-reactive) effects.
-    pub const LIGHT_NAMES: &'static [&'static str] = &["Static", "Breathing", "Color cycle", "Rainbow wave", "Color wave"];
+    pub const LIGHT_NAMES: &'static [&'static str] =
+        &["Static", "Breathing", "Color cycle", "Rainbow wave", "Color wave", "Pacifica", "Twinkle", "Meteor"];
     /// The sound-reactive effects.
-    pub const SOUND_NAMES: &'static [&'static str] =
-        &["Spectrum", "Beat pulse", "Ripple", "Sound stream", "Rain", "Level meter", "Radar", "Level colour"];
+    pub const SOUND_NAMES: &'static [&'static str] = &[
+        "Spectrum",
+        "Beat pulse",
+        "Ripple",
+        "Sound stream",
+        "Rain",
+        "Level meter",
+        "Radar",
+        "Level colour",
+        "Audio fire",
+        "Gravity meter",
+        "Frequency star",
+        "Spectrum bubbles",
+        "Pitch stream",
+        "DJ light",
+        "Noise move",
+        "Audio plasma",
+        "Spectrogram",
+        "Notes",
+        "Note cells",
+        "Note fields",
+        "Main note",
+    ];
+
+    /// Whether the effect's colours always come from the notes.
+    pub fn is_note_effect(&self) -> bool {
+        matches!(self, Effect::Notes(_) | Effect::NoteCells(_) | Effect::NoteFields(_) | Effect::MainNote(_))
+    }
 
     /// Whether the effect follows what the computer is playing.
     pub fn is_sound(&self) -> bool {
@@ -307,7 +500,20 @@ impl Effect {
             | Effect::Rain(s)
             | Effect::LevelMeter(s)
             | Effect::Radar(s)
-            | Effect::LevelColor(s) => Some(s),
+            | Effect::LevelColor(s)
+            | Effect::Notes(s)
+            | Effect::NoteCells(s)
+            | Effect::NoteFields(s)
+            | Effect::MainNote(s)
+            | Effect::AudioFire(s)
+            | Effect::GravityMeter(s)
+            | Effect::FrequencyStar(s)
+            | Effect::SpectrumBubbles(s)
+            | Effect::PitchStream(s)
+            | Effect::DjLight(s)
+            | Effect::NoiseMove(s)
+            | Effect::AudioPlasma(s)
+            | Effect::Spectrogram(s) => Some(s),
             _ => None,
         }
     }
@@ -321,7 +527,20 @@ impl Effect {
             | Effect::Rain(s)
             | Effect::LevelMeter(s)
             | Effect::Radar(s)
-            | Effect::LevelColor(s) => Some(s),
+            | Effect::LevelColor(s)
+            | Effect::Notes(s)
+            | Effect::NoteCells(s)
+            | Effect::NoteFields(s)
+            | Effect::MainNote(s)
+            | Effect::AudioFire(s)
+            | Effect::GravityMeter(s)
+            | Effect::FrequencyStar(s)
+            | Effect::SpectrumBubbles(s)
+            | Effect::PitchStream(s)
+            | Effect::DjLight(s)
+            | Effect::NoiseMove(s)
+            | Effect::AudioPlasma(s)
+            | Effect::Spectrogram(s) => Some(s),
             _ => None,
         }
     }
@@ -341,6 +560,22 @@ impl Effect {
             Effect::LevelMeter(_) => "Level meter",
             Effect::Radar(_) => "Radar",
             Effect::LevelColor(_) => "Level colour",
+            Effect::Notes(_) => "Notes",
+            Effect::NoteCells(_) => "Note cells",
+            Effect::NoteFields(_) => "Note fields",
+            Effect::MainNote(_) => "Main note",
+            Effect::AudioFire(_) => "Audio fire",
+            Effect::GravityMeter(_) => "Gravity meter",
+            Effect::FrequencyStar(_) => "Frequency star",
+            Effect::SpectrumBubbles(_) => "Spectrum bubbles",
+            Effect::PitchStream(_) => "Pitch stream",
+            Effect::DjLight(_) => "DJ light",
+            Effect::NoiseMove(_) => "Noise move",
+            Effect::AudioPlasma(_) => "Audio plasma",
+            Effect::Spectrogram(_) => "Spectrogram",
+            Effect::Pacifica { .. } => "Pacifica",
+            Effect::Twinkle { .. } => "Twinkle",
+            Effect::Meteor { .. } => "Meteor",
         }
     }
 
@@ -358,6 +593,22 @@ impl Effect {
             "Level meter" => Effect::LevelMeter(style),
             "Radar" => Effect::Radar(style),
             "Level colour" => Effect::LevelColor(style),
+            "Notes" => Effect::Notes(style),
+            "Note cells" => Effect::NoteCells(style),
+            "Note fields" => Effect::NoteFields(style),
+            "Main note" => Effect::MainNote(style),
+            "Audio fire" => Effect::AudioFire(style),
+            "Gravity meter" => Effect::GravityMeter(style),
+            "Frequency star" => Effect::FrequencyStar(style),
+            "Spectrum bubbles" => Effect::SpectrumBubbles(style),
+            "Pitch stream" => Effect::PitchStream(style),
+            "DJ light" => Effect::DjLight(style),
+            "Noise move" => Effect::NoiseMove(style),
+            "Audio plasma" => Effect::AudioPlasma(style),
+            "Spectrogram" => Effect::Spectrogram(style),
+            "Pacifica" => Effect::Pacifica { speed: 1.0 },
+            "Twinkle" => Effect::Twinkle { speed: 1.0 },
+            "Meteor" => Effect::Meteor { color: c, speed: 1.0 },
             "Static" => match self {
                 Effect::Static { .. } => self.clone(),
                 _ => Effect::Static { colors: vec![c] },
@@ -373,7 +624,7 @@ impl Effect {
     pub fn primary_color(&self) -> HexColor {
         match self {
             Effect::Static { colors } => colors.first().copied().unwrap_or_default(),
-            Effect::Breathing { color, .. } | Effect::ColorWave { color, .. } => *color,
+            Effect::Breathing { color, .. } | Effect::ColorWave { color, .. } | Effect::Meteor { color, .. } => *color,
             other => other.sound_style().map(|s| s.color).unwrap_or_default(),
         }
     }
@@ -382,7 +633,7 @@ impl Effect {
     pub fn set_color(&mut self, c: HexColor) {
         match self {
             Effect::Static { colors } => *colors = vec![c],
-            Effect::Breathing { color, .. } | Effect::ColorWave { color, .. } => *color = c,
+            Effect::Breathing { color, .. } | Effect::ColorWave { color, .. } | Effect::Meteor { color, .. } => *color = c,
             other => match other.sound_style_mut() {
                 Some(s) => {
                     s.color = c;
@@ -759,8 +1010,25 @@ impl Config {
         }
     }
 
+    /// The lighting a device shows: the shared effect while it is synced
+    /// on the Lighting page, else its own.
     pub fn lighting(&self, device: &str) -> Lighting {
+        if self.synced(device) {
+            return self.lighting_sync.lighting.clone();
+        }
         self.lighting.get(device).cloned().unwrap_or_default()
+    }
+
+    /// The lighting to change for a device (the shared one while synced).
+    pub fn lighting_mut(&mut self, device: &str) -> &mut Lighting {
+        if self.synced(device) {
+            return &mut self.lighting_sync.lighting;
+        }
+        self.lighting.entry(device.to_string()).or_default()
+    }
+
+    pub fn synced(&self, device: &str) -> bool {
+        self.lighting_sync.devices.contains(device)
     }
 
     pub fn key_action(&self, device: &str, key: &str) -> KeyAction {

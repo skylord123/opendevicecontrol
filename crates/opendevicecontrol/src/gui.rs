@@ -21,6 +21,8 @@ pub(crate) const BAD: Color32 = Color32::from_rgb(230, 80, 70);
 enum Page {
     /// Every device's sensors as one tree.
     Sensors,
+    /// One effect across the devices ticked there.
+    Lighting,
     Device(String),
     Settings,
 }
@@ -130,6 +132,7 @@ pub fn run(h: Handle, start_hidden: bool, start_page: Option<String>) -> eframe:
     let mut app = FerroApp::new(h.clone());
     app.page = Some(match start_page.as_deref() {
         Some("settings") => Page::Settings,
+        Some("lighting") => Page::Lighting,
         Some(p) => Page::Device(p.to_string()),
         None => Page::Sensors,
     });
@@ -234,6 +237,14 @@ fn style(ctx: &egui::Context) {
 }
 
 impl FerroApp {
+    pub(crate) fn open_device_page(&mut self, id: &str) {
+        self.page = Some(Page::Device(id.to_string()));
+    }
+
+    pub(crate) fn open_lighting_page(&mut self) {
+        self.page = Some(Page::Lighting);
+    }
+
     fn new(h: Handle) -> Self {
         let draft = h.config.read().clone();
         Self {
@@ -309,6 +320,11 @@ impl eframe::App for FerroApp {
                 if ui.selectable_label(self.page == Some(Page::Sensors), "📊 Sensors").clicked() {
                     self.page = Some(Page::Sensors);
                 }
+                if shared.devices.values().any(|d| !d.zones.is_empty())
+                    && ui.selectable_label(self.page == Some(Page::Lighting), "💡 Lighting").clicked()
+                {
+                    self.page = Some(Page::Lighting);
+                }
                 // This PC first, then devices by id.
                 let mut tabs: Vec<(&String, &DeviceView)> = shared.devices.iter().collect();
                 tabs.sort_by_key(|(id, d)| (d.info.kind != opendevicecontrol_core::DeviceKind::Computer, (*id).clone()));
@@ -368,6 +384,7 @@ impl eframe::App for FerroApp {
                     }
                 },
                 Some(Page::Settings) => self.settings_page(ui),
+                Some(Page::Lighting) => self.lighting_page(ui),
                 Some(Page::Sensors) if !shared.devices.is_empty() => self.sensors_page(ui),
                 Some(Page::Sensors) | None => {
                     ui.add_space(40.0);

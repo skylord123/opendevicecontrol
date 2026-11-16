@@ -41,6 +41,8 @@ pub struct AudioFrame {
     pub error: Option<String>,
     /// Seconds since capture started (drives sweeping effects).
     pub time: f32,
+    /// Musical notes being heard, loudest first (see [`crate::notes`]).
+    pub notes: Vec<crate::notes::Note>,
 }
 
 impl Default for AudioFrame {
@@ -53,6 +55,7 @@ impl Default for AudioFrame {
             beat_count: 0,
             error: None,
             time: 0.0,
+            notes: Vec::new(),
         }
     }
 }
@@ -195,6 +198,8 @@ pub struct Analyzer {
     since_beat: f32,
     history: VecDeque<f32>,
     since_history: f32,
+    /// Created for the sample rate on the first samples.
+    notes: Option<crate::notes::NoteFinder>,
 }
 
 impl Default for Analyzer {
@@ -208,6 +213,7 @@ impl Default for Analyzer {
             since_beat: 1.0,
             history: VecDeque::from(vec![0.0; HISTORY]),
             since_history: 0.0,
+            notes: None,
         }
     }
 }
@@ -223,6 +229,12 @@ impl Analyzer {
     /// beat started) each time a full window has been analysed.
     pub fn push(&mut self, samples: &[f32], rate: u32) -> Option<(AudioFrame, Option<f32>)> {
         self.buf.extend_from_slice(samples);
+        if self.notes.as_ref().is_none_or(|n| n.rate() != rate.max(8000)) {
+            self.notes = Some(crate::notes::NoteFinder::new(rate));
+        }
+        if let Some(n) = &mut self.notes {
+            n.push(samples);
+        }
         let mut out = None;
         while self.buf.len() >= FFT {
             let window: Vec<f32> = self.buf[..FFT].to_vec();
@@ -288,7 +300,10 @@ impl Analyzer {
             self.history.push_front(self.level);
             self.history.truncate(HISTORY);
         }
+        let mut notes = self.notes.as_mut().map(|n| n.update(dt).to_vec()).unwrap_or_default();
+        notes.sort_by(|a, b| b.amp.total_cmp(&a.amp));
         let frame = AudioFrame {
+            notes,
             bands: self.bands,
             level: self.level.clamp(0.0, 1.0),
             history: self.history.iter().copied().collect(),
