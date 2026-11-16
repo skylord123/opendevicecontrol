@@ -17,5 +17,10 @@ SUBSYSTEM=="hidraw", ATTRS{idVendor}=="258a", ATTRS{idProduct}=="010c", TAG+="ua
 SUBSYSTEM=="i2c-dev", KERNEL=="i2c-[0-9]*", ATTRS{name}=="SMBus I801 adapter*", TAG+="uaccess"
 SUBSYSTEM=="i2c-dev", KERNEL=="i2c-[0-9]*", ATTRS{name}=="SMBus PIIX4 adapter*", TAG+="uaccess"
 
+# ASUS graphics card lighting: port 1 of NVIDIA cards, the internal I2C bus
+# that carries the card's RGB controller (not a display's DDC bus). Needs
+# the i2c-dev module. Delete this line if you don't use it.
+SUBSYSTEM=="i2c-dev", KERNEL=="i2c-[0-9]*", ATTRS{name}=="NVIDIA i2c adapter 1 *", TAG+="uaccess"
+
 # Virtual keyboard for key actions
 KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"

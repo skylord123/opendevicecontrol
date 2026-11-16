@@ -18,6 +18,7 @@ Every device also appears in Home Assistant; see
 | **K55 RGB** keyboard | `1b1c:1b3d` | ✅ lighting, G-keys, Win lock |
 | **Aula F99** keyboard (2.4 GHz receiver or USB cable) | `3554:fa09`, `258a:010c` | ✅ per-key and sound-reactive lighting, built-in effects, battery, key remapping, macros, OS mode, Win-key lock, sleep, debounce. Bluetooth: not supported |
 | **ASRock Polychrome RGB** (motherboard lighting on recent ASRock boards) | `26ce:01a2` | ✅ every zone and addressable header, OpenDeviceControl and sound-reactive lighting, all 18 built-in effects with any colour, apply to all channels, LED counts |
+| **ASUS GeForce RTX 4070 Ti SUPER** lighting (PCI `10de:2705`, subsystem `1043:8957`) | n/a | ✅ all 4 LEDs, OpenDeviceControl and sound-reactive lighting, 14 built-in effects with colour, speed and direction. Linux: 🧪 same protocol, not yet tested on hardware |
 | K65 RGB / LUX RGB / RGB RAPIDFIRE keyboards | `1b1c:1b17, 1b37, 1b39` | 🧪 per-key lighting, special keys, Win lock |
 | K68 RGB keyboard | `1b1c:1b4f` | 🧪 per-key lighting, special keys, Win lock, polling rate |
 | K70 RGB / LUX RGB / RGB RAPIDFIRE keyboards | `1b1c:1b13, 1b33, 1b38` | 🧪 per-key lighting, special keys, Win lock |
@@ -159,6 +160,32 @@ controller should work too.
   green for strips that need it. Both are stored on the board.
 - Close ASRock Polychrome RGB first: two programs driving the board at once
   fight over it.
+
+## ASUS graphics cards
+
+The Aura lighting on ASUS GeForce cards: an ENE controller on the card's
+own I²C bus. Tested on an RTX 4070 Ti SUPER (subsystem `1043:8957`). Other
+ASUS cards with this controller probably work too, but each one has to be
+added to the list in the driver (`vendors/asus/mod.rs`), since the driver
+only talks to cards it knows.
+
+- **Lighting:** OpenDeviceControl effects and sound-reactive effects on the
+  card's 4 LEDs, or a built-in effect: off, static, breathing, flashing,
+  spectrum cycle, rainbow, spectrum cycle breathing, chase fade, spectrum
+  cycle chase fade, chase, spectrum cycle chase, spectrum cycle wave, chase
+  rainbow pulse and random flicker, with a colour, speed and direction where
+  the effect has them.
+- **Nothing is saved to the card.** OpenDeviceControl remembers the built-in
+  effect you pick and sets it again each time it starts. While it isn't
+  running (or before it starts), the card shows the effect last saved to it
+  by ASUS software, or the factory rainbow.
+- **Windows:** works through NVIDIA's own driver (NvAPI). No extra driver
+  and no administrator rights.
+- **Linux:** needs the NVIDIA driver, the `i2c-dev` module and the udev rule
+  shipped in `packaging/linux` (it opens up only the NVIDIA bus that carries
+  the lighting controller).
+- Close Armoury Crate, GPU Tweak or OpenRGB first: two programs driving the
+  card at once fight over it.
 
 ## Sound-reactive lighting
 

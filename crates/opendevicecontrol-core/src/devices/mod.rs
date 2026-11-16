@@ -198,6 +198,7 @@ pub fn discover(held: &[(CString, String)]) -> Result<Vec<(CString, Box<dyn Devi
     crate::vendors::corsair::discover(&api, &list, &mut ids, skip_paths, &mut out);
     crate::vendors::aula::discover(&api, &list, &mut ids, skip_paths, &mut out);
     crate::vendors::asrock::discover(&api, &list, &mut ids, skip_paths, &mut out);
+    crate::vendors::asus::discover(&mut ids, skip_paths, &mut out);
     for (_, d) in &out {
         crate::system::tree::own(d.info());
     }

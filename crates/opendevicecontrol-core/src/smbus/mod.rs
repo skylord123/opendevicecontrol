@@ -10,6 +10,8 @@
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(windows)]
+pub mod nvapi;
+#[cfg(windows)]
 pub mod pawnio;
 
 use crate::{Error, Result};

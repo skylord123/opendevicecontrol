@@ -3,5 +3,6 @@
 //! device list.
 
 pub mod asrock;
+pub mod asus;
 pub mod aula;
 pub mod corsair;
