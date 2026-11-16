@@ -17,6 +17,10 @@ use std::time::{Duration, Instant};
 const CACHE: Duration = Duration::from_millis(1500);
 /// Retry a source that was not there after this long.
 const RETRY: Duration = Duration::from_secs(20);
+/// After a failed read from the sensor service, its last readings are
+/// reused this long, so its nodes (the motherboard...) don't blink out of
+/// the tree and back.
+const SERVICE_HOLD: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Settings {
@@ -56,6 +60,8 @@ struct State {
     service_next: Instant,
     /// The sensor service's status lines, or why it can't be read.
     service: Result<Vec<String>, String>,
+    /// The sensor service's last good trees and when they were read.
+    service_last: Option<(Instant, Vec<ExtTree>)>,
     /// Sources that answered on the last refresh.
     active: Vec<String>,
     /// Bumped by [`configure`] and [`rescan`], so a refresh that started
@@ -76,6 +82,7 @@ fn state() -> MutexGuard<'static, State> {
             lhm_wmi_next: now,
             service_next: now,
             service: Err("not installed".into()),
+            service_last: None,
             active: Vec::new(),
             generation: 0,
         })
@@ -182,19 +189,33 @@ fn refresh(pawn: &mut Pawn) {
 
     // The sensor service does the privileged reads (PawnIO) for us.
     let mut from_service = false;
+    let mut service_trees = None;
     if service_due {
         match super::service::fetch() {
             Ok(snap) => {
                 from_service = true;
                 active.push("Sensor service".to_string());
                 service = Some(Ok(snap.status));
-                out.extend(snap.trees.into_iter().map(|t| t.into_tree()).filter(|t| !t.hardware.is_empty()));
+                let trees: Vec<ExtTree> = snap.trees.into_iter().map(|t| t.into_tree()).filter(|t| !t.hardware.is_empty()).collect();
+                out.extend(trees.iter().cloned());
+                service_trees = Some(trees);
             }
             Err(super::service::FetchError::Absent) => {
                 service = Some(Err("not installed".into()));
                 service_retry = true;
             }
-            Err(super::service::FetchError::Failed(e)) => service = Some(Err(e)),
+            Err(super::service::FetchError::Failed(e)) => {
+                log::debug!("sensor service: {e}");
+                let held = state().service_last.as_ref().filter(|(at, _)| at.elapsed() < SERVICE_HOLD).map(|(_, t)| t.clone());
+                if let Some(trees) = held {
+                    // A one-off failure: keep showing what it last read.
+                    from_service = true;
+                    active.push("Sensor service".to_string());
+                    out.extend(trees);
+                } else {
+                    service = Some(Err(e));
+                }
+            }
         }
     }
 
@@ -250,6 +271,9 @@ fn refresh(pawn: &mut Pawn) {
     let mut s = state();
     if let Some(r) = service {
         s.service = r;
+    }
+    if let Some(t) = service_trees {
+        s.service_last = Some((now, t));
     }
     s.pawn_line = match &*pawn {
         Pawn::Off if settings.pawnio || s.service.is_ok() => None,

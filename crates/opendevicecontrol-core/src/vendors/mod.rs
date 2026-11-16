@@ -2,5 +2,6 @@
 //! `discover()` that `crate::devices::discover` calls with the shared HID
 //! device list.
 
+pub mod asrock;
 pub mod aula;
 pub mod corsair;

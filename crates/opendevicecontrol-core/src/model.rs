@@ -357,6 +357,8 @@ pub enum ControlKind {
     Choice { options: Vec<String> },
     Number { min: f64, max: f64, step: f64, unit: String },
     Toggle,
+    /// An RGB colour; the value is a `Choice` holding `#rrggbb`.
+    Color,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

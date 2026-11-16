@@ -17,6 +17,7 @@ Every device also appears in Home Assistant; see
 | RM550i, RM650i, RM750i, RM850i, RM1000i | `1b1c:1c09–1c0d` | ✅ full |
 | **K55 RGB** keyboard | `1b1c:1b3d` | ✅ lighting, G-keys, Win lock |
 | **Aula F99** keyboard (2.4 GHz receiver or USB cable) | `3554:fa09`, `258a:010c` | ✅ per-key and sound-reactive lighting, built-in effects, battery, key remapping, macros, OS mode, Win-key lock, sleep, debounce. Bluetooth: not supported |
+| **ASRock Polychrome RGB** (motherboard lighting on recent ASRock boards) | `26ce:01a2` | ✅ every zone and addressable header, OpenDeviceControl and sound-reactive lighting, all 18 built-in effects with any colour, apply to all channels, LED counts |
 | K65 RGB / LUX RGB / RGB RAPIDFIRE keyboards | `1b1c:1b17, 1b37, 1b39` | 🧪 per-key lighting, special keys, Win lock |
 | K68 RGB keyboard | `1b1c:1b4f` | 🧪 per-key lighting, special keys, Win lock, polling rate |
 | K70 RGB / LUX RGB / RGB RAPIDFIRE keyboards | `1b1c:1b13, 1b33, 1b38` | 🧪 per-key lighting, special keys, Win lock |
@@ -137,6 +138,27 @@ driver.
   built-in effect.
 - Not available: polling rate and NKRO (no firmware setting), remapping the
   Mac modes' base layer, Bluetooth.
+
+## ASRock Polychrome RGB
+
+The lighting controller on recent ASRock motherboards (a USB device inside
+the board, `26ce:01a2`). Tested on a B650E board; other boards with this
+controller should work too.
+
+- **Zones:** whatever the board has of RGB LED 1 and 2, addressable RGB LED
+  1 to 3, the PCH heatsink, the I/O cover and the PCB, named as in ASRock's
+  utility. The board reports which ones exist and how many LEDs each has.
+  Zones can be renamed (the pencil next to each one), say "Rear case fan".
+- **Lighting:** OpenDeviceControl effects and sound-reactive effects on every
+  LED, or a built-in effect per zone: off, static, breathing, strobe, colour
+  cycle, random, music, wave, spring, stack, cram, scan, neon, water,
+  rainbow, rainbow 2, glow stream, luminous tide. Built-in effects are saved
+  to the board when OpenDeviceControl closes, so they stay after a reboot.
+- **Apply to all channels:** one effect on every zone, running in step.
+- **Addressable headers:** set how many LEDs are plugged in, and swap red and
+  green for strips that need it. Both are stored on the board.
+- Close ASRock Polychrome RGB first: two programs driving the board at once
+  fight over it.
 
 ## Sound-reactive lighting
 

@@ -7,7 +7,8 @@ use crate::gui::{section, FerroApp, ACCENT, BAD, WARN};
 use crate::service::{Command, DeviceView};
 use eframe::egui::{self, Color32, RichText};
 use opendevicecontrol_core::devices::{HW_LIGHTING_PREFIX, SOFTWARE_LIGHTING};
-use opendevicecontrol_core::{Control, ControlKind, ControlValue, LedShape, Rgb};
+use opendevicecontrol_core::{Control, ControlKind, ControlValue, LedShape, LightZone, Rgb};
+use std::collections::HashMap;
 use std::time::Duration;
 
 /// Draw a device's LEDs where they physically sit (e.g. a keyboard's keys),
@@ -171,6 +172,26 @@ fn is_lighting_control(id: &str) -> bool {
     id == SOFTWARE_LIGHTING || id.starts_with(HW_LIGHTING_PREFIX)
 }
 
+/// The zone being renamed, while the rename dialog is open.
+#[derive(Clone)]
+struct Rename {
+    /// `"<device id>/<zone id>"`.
+    key: String,
+    device_name: String,
+    text: String,
+    /// Focus the name field (once, when the dialog opens).
+    focus: bool,
+}
+
+fn rename_id() -> egui::Id {
+    egui::Id::unique("zone_rename_dialog")
+}
+
+/// "1", "0.5", "21" for a step hint.
+fn fmt_step(step: f64) -> String {
+    if step.fract() == 0.0 { format!("{step:.0}") } else { format!("{step}") }
+}
+
 fn to_c32(c: Rgb) -> Color32 {
     Color32::from_rgb(c.r, c.g, c.b)
 }
@@ -203,10 +224,140 @@ impl FerroApp {
     /// One device control: checkbox, choice or slider, sent to the device
     /// when changed.
     fn control_widget(&self, ui: &mut egui::Ui, dev: &str, c: &Control) {
+        self.labeled_control(ui, dev, c, &c.name);
+    }
+
+    /// Controls named "Part: setting" (a lighting zone, a fan header...)
+    /// get a box per part, side by side when there is room; the rest are
+    /// listed first.
+    fn grouped_controls(&self, ui: &mut egui::Ui, dev: &str, controls: &[&Control], aliases: &HashMap<String, String>) {
+        let mut groups: Vec<(&str, Vec<(&Control, &str)>)> = Vec::new();
+        for c in controls {
+            match c.name.split_once(": ") {
+                Some((part, label)) => match groups.iter_mut().find(|g| g.0 == part) {
+                    Some(g) => g.1.push((c, label)),
+                    None => groups.push((part, vec![(c, label)])),
+                },
+                None => self.control_widget(ui, dev, c),
+            }
+        }
+        if groups.is_empty() {
+            return;
+        }
+        let cols = if ui.available_width() > 720.0 { 2 } else { 1 };
+        for row in groups.chunks(cols) {
+            ui.columns(cols, |columns| {
+                for (col, (part, items)) in columns.iter_mut().zip(row) {
+                    let alias = aliases.get(*part);
+                    section(col, "", |ui| {
+                        // A renamed zone: its name, and the device's beside it.
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(alias.map(String::as_str).unwrap_or(part)).strong());
+                            if alias.is_some() {
+                                ui.label(RichText::new(*part).small().weak()).on_hover_text("The device's name for this zone");
+                            }
+                        });
+                        ui.add_space(2.0);
+                        for (c, label) in items {
+                            self.labeled_control(ui, dev, c, label);
+                        }
+                    });
+                }
+            });
+            ui.add_space(4.0);
+        }
+    }
+
+    /// The names the user gave this device's zones: driver name → name.
+    fn zone_aliases(&self, dev: &str, zones: &[LightZone]) -> HashMap<String, String> {
+        let cfg = self.h.config.read();
+        zones
+            .iter()
+            .filter_map(|z| cfg.zone_names.get(&format!("{dev}/{}", z.id)).map(|n| (z.name.clone(), n.clone())))
+            .collect()
+    }
+
+    /// A zone's name in the preview, with a button that opens the rename
+    /// dialog (the device's own name shows on hover).
+    fn zone_label(&self, ui: &mut egui::Ui, dev: &str, z: &LightZone, name: &str) {
+        ui.horizontal(|ui| {
+            ui.set_width(170.0);
+            let hover = if name == z.name { name.to_string() } else { format!("{name} (the device calls it {})", z.name) };
+            ui.add(egui::Label::new(RichText::new(name).strong()).truncate()).on_hover_text(hover);
+            if ui.small_button("✏").on_hover_text("Rename this zone").clicked() {
+                let st = Rename { key: format!("{dev}/{}", z.id), device_name: z.name.clone(), text: name.to_string(), focus: true };
+                ui.data_mut(|m| m.insert_temp(rename_id(), st));
+            }
+        });
+    }
+
+    /// The rename dialog, while one is open.
+    fn rename_dialog(&self, ctx: &egui::Context) {
+        let Some(mut st) = ctx.data(|m| m.get_temp::<Rename>(rename_id())) else { return };
+        let renamed = self.h.config.read().zone_names.contains_key(&st.key);
+        // None: keep the dialog open; Some(None): close; Some(Some(name)):
+        // save (an empty name goes back to the device's).
+        let mut done: Option<Option<String>> = None;
+        let modal = egui::Modal::new(rename_id().with("modal")).show(ctx, |ui| {
+            ui.set_width(340.0);
+            ui.heading("Rename zone");
+            ui.label(RichText::new(format!("The device calls this zone \"{}\".", st.device_name)).weak());
+            ui.add_space(6.0);
+            let r = ui.add(egui::TextEdit::singleline(&mut st.text).hint_text(&st.device_name).desired_width(f32::INFINITY));
+            if std::mem::take(&mut st.focus) {
+                r.request_focus();
+            }
+            if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                done = Some(Some(st.text.clone()));
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() {
+                    done = Some(Some(st.text.clone()));
+                }
+                if ui.button("Cancel").clicked() {
+                    done = Some(None);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(renamed, egui::Button::new("Use the device's name"))
+                        .on_hover_text(format!("Back to \"{}\"", st.device_name))
+                        .clicked()
+                    {
+                        done = Some(Some(String::new()));
+                    }
+                });
+            });
+        });
+        if modal.should_close() && done.is_none() {
+            done = Some(None); // Escape or a click outside
+        }
+        match done {
+            None => {
+                ctx.data_mut(|m| m.insert_temp(rename_id(), st));
+            }
+            Some(save) => {
+                ctx.data_mut(|m| m.remove::<Rename>(rename_id()));
+                if let Some(text) = save {
+                    let text = text.trim().to_string();
+                    let (key, device_name) = (st.key, st.device_name);
+                    self.h.update_config(|c| {
+                        if text.is_empty() || text == device_name {
+                            c.zone_names.remove(&key);
+                        } else {
+                            c.zone_names.insert(key.clone(), text.clone());
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    fn labeled_control(&self, ui: &mut egui::Ui, dev: &str, c: &Control, name: &str) {
         match (&c.kind, &c.value) {
             (ControlKind::Toggle, ControlValue::Bool(on)) => {
                 let mut v = *on;
-                let r = ui.checkbox(&mut v, &c.name);
+                let r = ui.checkbox(&mut v, name);
                 if r.changed() {
                     let _ = self.h.cmd.send(Command::SetControl {
                         device: dev.to_string(),
@@ -224,7 +375,7 @@ impl FerroApp {
                 // get a drop-down; short ones stay one click away.
                 if options.len() > 6 {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(&c.name).strong());
+                        ui.label(RichText::new(name).strong());
                         egui::ComboBox::from_id_salt(("choice_control", &c.id)).selected_text(cur.as_str()).show_ui(
                             ui,
                             |ui| {
@@ -238,7 +389,7 @@ impl FerroApp {
                     });
                 } else {
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new(&c.name).strong());
+                        ui.label(RichText::new(name).strong());
                         for o in options {
                             if ui.selectable_label(cur == o, o).clicked() {
                                 picked = Some(o);
@@ -257,23 +408,67 @@ impl FerroApp {
                     ui.label(RichText::new(h).small().weak());
                 }
             }
-            (ControlKind::Number { min, max, step, unit }, ControlValue::Number(cur)) => {
-                // Keep the dragged value locally until release.
-                let tmp = ui.scope_id().with(("number_control", &c.id));
-                let mut v = ui.data(|m| m.get_temp::<f64>(tmp)).unwrap_or(*cur);
-                let r = ui
+            (ControlKind::Color, ControlValue::Choice(hex)) => {
+                // Shown live while picking: the local value wins until the
+                // device reports the new one.
+                let tmp = ui.scope_id().with(("color_control", &c.id));
+                let cur = ui.data(|m| m.get_temp::<String>(tmp)).unwrap_or_else(|| hex.clone());
+                let parsed = u32::from_str_radix(cur.trim_start_matches('#'), 16).unwrap_or(0);
+                let mut rgb = [(parsed >> 16) as u8, (parsed >> 8) as u8, parsed as u8];
+                let changed = ui
                     .horizontal(|ui| {
-                        ui.label(RichText::new(&c.name).strong());
-                        ui.add(egui::Slider::new(&mut v, *min..=*max).step_by(*step).suffix(format!(" {unit}")))
+                        ui.label(RichText::new(name).strong());
+                        egui::color_picker::color_edit_button_srgb(ui, &mut rgb).changed()
                     })
                     .inner;
-                // Send once the slider is released (or on keyboard/click edits).
-                if r.dragged() {
-                    ui.data_mut(|m| m.insert_temp(tmp, v));
-                } else {
-                    ui.data_mut(|m| m.remove::<f64>(tmp));
+                if changed {
+                    let new = Rgb::new(rgb[0], rgb[1], rgb[2]).to_hex();
+                    ui.data_mut(|m| m.insert_temp(tmp, new.clone()));
+                    let _ = self.h.cmd.send(Command::SetControl { device: dev.to_string(), id: c.id.clone(), value: ControlValue::Choice(new) });
+                } else if *hex == cur {
+                    ui.data_mut(|m| m.remove::<String>(tmp));
                 }
-                if (r.drag_stopped() || (r.changed() && !r.dragged())) && v != *cur {
+                if let Some(h) = c.help.as_deref().filter(|h| !h.is_empty()) {
+                    ui.label(RichText::new(h).small().weak());
+                }
+            }
+            (ControlKind::Number { min, max, step, unit }, ControlValue::Number(cur)) => {
+                // The value being dragged, or sent and not yet reported back
+                // by the device, is shown instead of the device's.
+                // (value, the device's value when it was set)
+                let tmp = egui::Id::unique(("number_control", dev, &c.id));
+                let pending = ui.data(|m| m.get_temp::<(f64, f64)>(tmp));
+                let mut v = pending.map_or(*cur, |p| p.0);
+                let step = if *step > 0.0 { *step } else { 1.0 };
+                let (mut send, mut dragging) = (false, false);
+                // A fixed id, so the slider keeps keyboard focus (arrow keys
+                // step it) when the page around it changes.
+                ui.push_id(("number_control", &c.id), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(name).strong());
+                        if ui.small_button("−").on_hover_text(format!("{} less", fmt_step(step))).clicked() {
+                            v = (v - step).max(*min);
+                            send = true;
+                        }
+                        let r = ui.add(egui::Slider::new(&mut v, *min..=*max).step_by(step).suffix(format!(" {unit}")));
+                        if ui.small_button("+").on_hover_text(format!("{} more", fmt_step(step))).clicked() {
+                            v = (v + step).min(*max);
+                            send = true;
+                        }
+                        dragging = r.dragged();
+                        // Send once the slider is released, or on a keyboard
+                        // or typed edit.
+                        send |= r.drag_stopped() || (r.changed() && !r.dragged());
+                    });
+                });
+                if dragging || send {
+                    let was = pending.map_or(*cur, |p| p.1);
+                    ui.data_mut(|m| m.insert_temp(tmp, (v, was)));
+                } else if pending.is_some_and(|p| p.0 == *cur || p.1 != *cur) {
+                    // Applied, or the device settled on another value.
+                    ui.data_mut(|m| m.remove::<(f64, f64)>(tmp));
+                }
+                if send && v != *cur {
                     let _ = self.h.cmd.send(Command::SetControl {
                         device: dev.to_string(),
                         id: c.id.clone(),
@@ -290,6 +485,7 @@ impl FerroApp {
 
     pub(crate) fn peripheral_page(&mut self, ui: &mut egui::Ui, d: &DeviceView) {
         let dev = d.info.id.clone();
+        self.rename_dialog(ui.ctx());
         ui.horizontal(|ui| {
             ui.heading(d.info.display_name());
             if d.online {
@@ -390,6 +586,7 @@ impl FerroApp {
         if show(Tab::Lighting) {
             // ---- lighting ----
             if !d.zones.is_empty() {
+                let aliases = self.zone_aliases(&dev, &d.zones);
                 let mut l = self.h.config.read().lighting(&dev);
                 let before = l.clone();
                 section(ui, "Lighting", |ui| {
@@ -398,28 +595,36 @@ impl FerroApp {
                     if !d.led_layout.is_empty() {
                         draw_layout(ui, &d.led_layout, &d.lights);
                     }
-                    // Otherwise swatches; per-key devices have 100+ LEDs:
+                    // Otherwise swatches, a row per zone (named, renamable)
+                    // when there are several; zones with many LEDs get
                     // smaller swatches, wrapped.
-                    let many = d.zones.iter().map(|z| z.leds).sum::<usize>() > 16;
-                    let (swatch, round) = if many { (egui::vec2(12.0, 12.0), 2.0) } else { (egui::vec2(56.0, 28.0), 6.0) };
                     if d.led_layout.is_empty() {
-                        ui.horizontal_wrapped(|ui| {
-                            if many {
-                                ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
-                            }
-                            let mut i = 0;
-                            for z in &d.zones {
-                                for _ in 0..z.leds {
-                                    let c = d.lights.get(i).copied().unwrap_or_default();
-                                    let (rect, resp) = ui.allocate_exact_size(swatch, egui::Sense::hover());
-                                    ui.painter().rect_filled(rect, round, to_c32(c));
-                                    ui.painter().rect_stroke(rect, round, egui::Stroke::new(1.0, Color32::from_gray(70)), egui::StrokeKind::Inside);
-                                    resp.on_hover_text(format!("{} {}", z.name, c.to_hex()));
-                                    i += 1;
+                        let multi = d.zones.len() > 1;
+                        let mut i = 0;
+                        for z in &d.zones {
+                            let name = aliases.get(&z.name).cloned().unwrap_or_else(|| z.name.clone());
+                            ui.horizontal(|ui| {
+                                if multi {
+                                    self.zone_label(ui, &dev, z, &name);
                                 }
-                            }
-                            ui.label(RichText::new("live preview").small().weak());
-                        });
+                                let many = z.leds > 16;
+                                let (swatch, round) = if many { (egui::vec2(12.0, 12.0), 2.0) } else { (egui::vec2(40.0, 22.0), 5.0) };
+                                ui.horizontal_wrapped(|ui| {
+                                    if many {
+                                        ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
+                                    }
+                                    for _ in 0..z.leds {
+                                        let c = d.lights.get(i).copied().unwrap_or_default();
+                                        let (rect, resp) = ui.allocate_exact_size(swatch, egui::Sense::hover());
+                                        ui.painter().rect_filled(rect, round, to_c32(c));
+                                        ui.painter().rect_stroke(rect, round, egui::Stroke::new(1.0, Color32::from_gray(70)), egui::StrokeKind::Inside);
+                                        resp.on_hover_text(format!("{name} {}", c.to_hex()));
+                                        i += 1;
+                                    }
+                                });
+                            });
+                        }
+                        ui.label(RichText::new("live preview").small().weak());
                     }
                     ui.add_space(6.0);
                     // Where the lighting comes from: OpenDeviceControl's effects, its
@@ -483,9 +688,8 @@ impl FerroApp {
                             let _ = self.h.cmd.send(Command::PreviewKey { device: dev.clone(), key: key.into() });
                         }
                         ui.ctx().request_repaint_after(Duration::from_millis(33));
-                        for c in d.controls.iter().filter(|c| c.id.starts_with(HW_LIGHTING_PREFIX)) {
-                            self.control_widget(ui, &dev, c);
-                        }
+                        let hw: Vec<&Control> = d.controls.iter().filter(|c| c.id.starts_with(HW_LIGHTING_PREFIX)).collect();
+                        self.grouped_controls(ui, &dev, &hw, &aliases);
                         return;
                     }
                     if picked == Mode::Sound {
@@ -526,7 +730,7 @@ impl FerroApp {
                                 if per_zone {
                                     colors.resize(zones.len(), colors.last().copied().unwrap_or_default());
                                     for (z, c) in zones.iter().zip(colors.iter_mut()) {
-                                        ui.label(&z.name);
+                                        ui.label(aliases.get(&z.name).unwrap_or(&z.name));
                                         color_button(ui, c);
                                         ui.add_space(8.0);
                                     }
@@ -704,9 +908,7 @@ impl FerroApp {
         // shown with the lighting) ----
         if show(Tab::Settings) && !settings.is_empty() {
             section(ui, "Settings", |ui| {
-                for c in settings {
-                    self.control_widget(ui, &dev, c);
-                }
+                self.grouped_controls(ui, &dev, &settings, &self.zone_aliases(&dev, &d.zones));
             });
             ui.add_space(6.0);
         }

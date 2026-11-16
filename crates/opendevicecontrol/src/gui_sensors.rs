@@ -635,6 +635,10 @@ impl FerroApp {
                         }
                         ui.separator();
                     }
+                    if ui.button("Copy name").clicked() {
+                        actions.push(TreeAction::Copy(s.name.clone()));
+                        ui.close();
+                    }
                     if ui.button("Copy value").clicked() {
                         actions.push(TreeAction::Copy(value_text(s, s.value)));
                         ui.close();
@@ -668,6 +672,12 @@ impl FerroApp {
                         }
                         ui.separator();
                     }
+                    // The motherboard's, CPU's... model, to look up.
+                    if ui.button("Copy name").clicked() {
+                        actions.push(TreeAction::Copy(row.label.clone()));
+                        ui.close();
+                    }
+                    ui.separator();
                     if ui.button("Expand everything below").clicked() {
                         for r in rows.iter().filter(|r| r.key.starts_with(&row.key)) {
                             st.open.insert(r.key.clone(), true);

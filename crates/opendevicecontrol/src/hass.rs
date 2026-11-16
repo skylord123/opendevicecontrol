@@ -112,6 +112,7 @@ fn control_icon(c: &opendevicecontrol_core::Control) -> &'static str {
             ControlKind::Choice { .. } => "mdi:form-select",
             ControlKind::Toggle => "mdi:toggle-switch-outline",
             ControlKind::Number { .. } => "mdi:tune",
+            ControlKind::Color => "mdi:palette",
         }
     }
 }
@@ -617,7 +618,7 @@ impl<'a> Session<'a> {
         if let Some(c) = view.controls.iter().find(|c| c.id == ctrl) {
             let value = match &c.kind {
                 ControlKind::Toggle => ControlValue::Bool(text.eq_ignore_ascii_case("ON")),
-                ControlKind::Choice { .. } => ControlValue::Choice(text.to_string()),
+                ControlKind::Choice { .. } | ControlKind::Color => ControlValue::Choice(text.trim().to_string()),
                 ControlKind::Number { .. } => match text.parse() {
                     Ok(v) => ControlValue::Number(v),
                     Err(_) => return,
@@ -929,6 +930,18 @@ impl<'a> Session<'a> {
                     m.insert("entity_category".into(), json!("config"));
                     m.insert("icon".into(), json!(control_icon(c)));
                     out.push((self.t.discovery("number", dev, &c.id), Value::Object(m)));
+                }
+                ControlKind::Color => {
+                    // A text entity taking #rrggbb.
+                    let mut m = self.common(v, &c.id, &c.name);
+                    m.insert("command_topic".into(), json!(self.t.command(dev, &c.id)));
+                    m.insert("value_template".into(), json!(format!("{{{{ {} }}}}", value_of(&c.id))));
+                    m.insert("pattern".into(), json!("^#[0-9a-fA-F]{6}$"));
+                    m.insert("min".into(), json!(7));
+                    m.insert("max".into(), json!(7));
+                    m.insert("entity_category".into(), json!("config"));
+                    m.insert("icon".into(), json!(control_icon(c)));
+                    out.push((self.t.discovery("text", dev, &c.id), Value::Object(m)));
                 }
             }
         }

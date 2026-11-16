@@ -166,6 +166,10 @@ pub struct Config {
     /// `"<device id>/<sensor id>"`, where the user changed the default
     /// (everything except detail sensors is sent by default).
     pub ha_sensors: BTreeMap<String, bool>,
+    /// Names the user gave lighting zones, per `"<device id>/<zone id>"`
+    /// (e.g. "Rear case fan" for a header the board calls "Audio").
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub zone_names: BTreeMap<String, String>,
 }
 
 /// Where This PC gets temperatures on Windows besides the OS (which has
