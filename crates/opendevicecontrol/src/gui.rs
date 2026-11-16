@@ -312,36 +312,11 @@ impl eframe::App for FerroApp {
             self.page = shared.devices.keys().next().map(|k| Page::Device(k.clone()));
         }
 
+        // Top bar: the name and the Home Assistant status.
         egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("⚡ OpenDeviceControl").strong().size(18.0).color(ACCENT));
-                ui.separator();
-                if ui.selectable_label(self.page == Some(Page::Sensors), "📊 Sensors").clicked() {
-                    self.page = Some(Page::Sensors);
-                }
-                if shared.devices.values().any(|d| !d.zones.is_empty())
-                    && ui.selectable_label(self.page == Some(Page::Lighting), "💡 Lighting").clicked()
-                {
-                    self.page = Some(Page::Lighting);
-                }
-                // This PC first, then devices by id.
-                let mut tabs: Vec<(&String, &DeviceView)> = shared.devices.iter().collect();
-                tabs.sort_by_key(|(id, d)| (d.info.kind != opendevicecontrol_core::DeviceKind::Computer, (*id).clone()));
-                for (id, d) in tabs {
-                    let p = Page::Device(id.clone());
-                    let label = RichText::new(format!("{} {}", if d.online { "●" } else { "○" }, d.info.model))
-                        .color(if d.online { ACCENT } else { BAD });
-                    if ui.selectable_label(self.page.as_ref() == Some(&p), label).clicked() {
-                        self.page = Some(p);
-                    }
-                }
-                if shared.devices.is_empty() {
-                    ui.label(RichText::new("searching for devices…").italics().weak());
-                }
-                if ui.selectable_label(self.page == Some(Page::Settings), "⚙ Settings").clicked() {
-                    self.page = Some(Page::Settings);
-                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let (txt, col) = match &shared.mqtt {
                         MqttStatus::Disabled => ("Home Assistant: off".to_string(), Color32::GRAY),
@@ -356,6 +331,64 @@ impl eframe::App for FerroApp {
                 });
             });
             ui.add_space(4.0);
+        });
+
+        // Navigation down the left: overview pages, every device (one per
+        // row, so any number fits), then Settings. It all scrolls together
+        // when the window is short.
+        egui::Panel::left("nav").resizable(false).exact_size(200.0).show(ui, |ui| {
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                ui.add_space(8.0);
+                // Full-width rows, text on the left.
+                ui.spacing_mut().button_padding = egui::vec2(8.0, 5.0);
+                let item = |ui: &mut egui::Ui, on: bool, text: egui::WidgetText| {
+                    ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| ui.selectable_label(on, text)).inner
+                };
+                if item(ui, self.page == Some(Page::Sensors), "📊  Sensors".into()).clicked() {
+                    self.page = Some(Page::Sensors);
+                }
+                if shared.devices.values().any(|d| !d.zones.is_empty()) && item(ui, self.page == Some(Page::Lighting), "💡  Lighting".into()).clicked() {
+                    self.page = Some(Page::Lighting);
+                }
+                ui.add_space(10.0);
+                ui.label(RichText::new("DEVICES").small().weak());
+                ui.add_space(2.0);
+                // This PC first, then devices by name.
+                let mut tabs: Vec<(&String, &DeviceView)> = shared.devices.iter().collect();
+                tabs.sort_by_key(|(id, d)| (d.info.kind != opendevicecontrol_core::DeviceKind::Computer, d.info.model.clone(), (*id).clone()));
+                for (id, d) in tabs {
+                    let p = Page::Device(id.clone());
+                    let dot = RichText::new(if d.online { "●" } else { "○" }).color(if d.online { ACCENT } else { BAD });
+                    let mut job = egui::text::LayoutJob::default();
+                    dot.append_to(&mut job, ui.style(), egui::FontSelection::Default, egui::Align::Center);
+                    RichText::new(format!("  {}", d.info.model)).append_to(&mut job, ui.style(), egui::FontSelection::Default, egui::Align::Center);
+                    // One line per device (long names end in "…"; the full
+                    // name shows on hover), so every row is the same height.
+                    job.wrap = egui::text::TextWrapping {
+                        max_width: ui.available_width() - 2.0 * ui.spacing().button_padding.x,
+                        max_rows: 1,
+                        break_anywhere: true,
+                        overflow_character: Some('…'),
+                    };
+                    let on = self.page.as_ref() == Some(&p);
+                    let r = item(ui, on, job.into());
+                    let r = r.on_hover_text(if d.online { d.info.display_name() } else { format!("{} (offline)", d.info.display_name()) });
+                    if r.clicked() {
+                        self.page = Some(p);
+                    }
+                }
+                if shared.devices.is_empty() {
+                    ui.label(RichText::new("searching for devices…").italics().weak());
+                }
+                // The same gap on both sides of the divider.
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(6.0);
+                if item(ui, self.page == Some(Page::Settings), "⚙  Settings".into()).clicked() {
+                    self.page = Some(Page::Settings);
+                }
+                ui.add_space(8.0);
+            });
         });
 
         if !shared.conflicts.is_empty() {
@@ -375,7 +408,7 @@ impl eframe::App for FerroApp {
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.page.clone() {
+            egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| match self.page.clone() {
                 Some(Page::Device(id)) => match shared.devices.get(&id) {
                     Some(d) if d.info.kind == opendevicecontrol_core::DeviceKind::PowerSupply => self.device_page(ui, d),
                     Some(d) => self.peripheral_page(ui, d),
