@@ -103,7 +103,7 @@ assets = [
 name = "opendevicecontrol"
 summary = "PC hardware and peripheral monitor/controller with Home Assistant integration"
 license = "GPL-3.0-or-later"
-post_install_script = "udevadm control --reload-rules >/dev/null 2>&1 || :; udevadm trigger --subsystem-match=hidraw --action=change >/dev/null 2>&1 || :; udevadm trigger --subsystem-match=leds --action=change >/dev/null 2>&1 || :; modprobe i2c-dev >/dev/null 2>&1 || :; udevadm trigger --subsystem-match=i2c-dev --action=change >/dev/null 2>&1 || :"
+post_install_script = "udevadm control --reload-rules >/dev/null 2>&1 || :; udevadm trigger --subsystem-match=hidraw --action=change >/dev/null 2>&1 || :; udevadm trigger --subsystem-match=leds --action=change >/dev/null 2>&1 || :; udevadm trigger --subsystem-match=misc --sysname-match=uinput --action=change >/dev/null 2>&1 || :; modprobe i2c-dev >/dev/null 2>&1 || :; udevadm trigger --subsystem-match=i2c-dev --action=change >/dev/null 2>&1 || :"
 post_uninstall_script = "udevadm control --reload-rules >/dev/null 2>&1 || :"
 # Like packaging/linux/debian/prerm: stop running copies cleanly (hands the
 # PSU fan back to hardware control) before an upgrade replaces the binary

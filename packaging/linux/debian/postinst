@@ -6,6 +6,7 @@ if [ "$1" = "configure" ] && command -v udevadm >/dev/null 2>&1; then
     udevadm control --reload-rules || true
     udevadm trigger --subsystem-match=hidraw --action=change || true
     udevadm trigger --subsystem-match=leds --action=change || true
+    udevadm trigger --subsystem-match=misc --sysname-match=uinput --action=change || true
 fi
 # i2c-dev for RAM lighting (also loaded at boot via modules-load.d).
 if [ "$1" = "configure" ] && command -v modprobe >/dev/null 2>&1; then
