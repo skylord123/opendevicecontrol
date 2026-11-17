@@ -74,6 +74,75 @@ actions:
     target: { entity_id: light.office }
 ```
 
+## Lighting
+
+Every device shows up as connected through the computer (named after it,
+so several PCs with the same parts stay apart), and lighting comes as
+ordinary Home Assistant lights:
+
+| Entity | On | What it controls |
+|---|---|---|
+| `light` "PC lighting" | the computer | The shared effect of the devices synced on the Lighting page |
+| `light` "Lighting" | each device with LEDs | The device's own effect (the shared one while it is synced) |
+| `light` "*Channel* lighting", "*Channel* *Fan 1* lighting" | the device | A channel, fan or strip given an effect of its own in the app |
+| `switch` "Follow PC lighting" | each device with LEDs | Whether the device runs the shared effect |
+
+Each light has on/off, brightness, a colour and an effect list with every
+effect by its name in the app (`Rainbow wave`, `Spectrum`, `Audio fire`,
+`Notes`...). On devices with their own built-in effects (an ASRock board,
+the F99, an ASUS card), the "OpenDeviceControl lighting" switch hands the
+LEDs back to the device.
+
+Lights off while nobody is home, back on when someone arrives:
+
+```yaml
+triggers:
+  - trigger: state
+    entity_id: zone.home
+    to: "0"
+    id: away
+  - trigger: numeric_state
+    entity_id: zone.home
+    above: 0
+    id: home
+actions:
+  - action: light.turn_{{ 'off' if trigger.id == 'away' else 'on' }}
+    target: { entity_id: light.my_pc_pc_lighting }
+```
+
+Sound-reactive lighting while music plays, a calm effect after:
+
+```yaml
+triggers:
+  - trigger: state
+    entity_id: media_player.living_room
+    to: playing
+    id: music
+  - trigger: state
+    entity_id: media_player.living_room
+    from: playing
+    id: stopped
+actions:
+  - action: light.turn_on
+    target: { entity_id: light.my_pc_pc_lighting }
+    data:
+      effect: "{{ 'Notes' if trigger.id == 'music' else 'Pacifica' }}"
+```
+
+Let the keyboard do its own thing while a game runs:
+
+```yaml
+actions:
+  - action: switch.turn_off
+    target: { entity_id: switch.my_pc_aula_f99_follow_pc_lighting }
+  - action: light.turn_on
+    target: { entity_id: light.my_pc_aula_f99_lighting }
+    data: { effect: Static, rgb_color: [255, 40, 0] }
+```
+
+Entity ids depend on the names Home Assistant gave the entities; check
+yours under Settings → Devices & services → MQTT.
+
 ## Dual boot
 
 Run OpenDeviceControl on both operating systems with the **same Node ID**

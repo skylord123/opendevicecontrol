@@ -5,7 +5,7 @@
 //! fixed-duty `number`. State is published as one retained JSON document per
 //! device, so HA (and the other OS when dual-booting) sees the last values.
 
-use crate::config::{Effect, FanPolicy, HexColor, Mqtt};
+use crate::config::{Config, Effect, FanPolicy, HexColor, Mqtt};
 use crate::service::{Command, DeviceView, Handle, KeyEvent, MqttStatus};
 use crossbeam_channel::{select, Receiver};
 use opendevicecontrol_core::{ControlKind, ControlValue, SensorKind};
@@ -79,6 +79,111 @@ fn is_lock(s: &opendevicecontrol_core::Sensor) -> bool {
 
 /// `{{ value_json['id'] }}`: bracket access works for any id (one starting
 /// with a digit, or named like a dict method).
+/// One of the lights OpenDeviceControl offers Home Assistant.
+#[derive(Debug, Clone, PartialEq)]
+enum LightTarget {
+    /// A device's own lighting (`lighting`).
+    Device,
+    /// The Lighting page's shared effect, on This PC (`pc_lighting`).
+    Shared,
+    /// A channel (`"<zone>"`) or a fan or strip on it (`"<zone>/<start>"`)
+    /// with an effect of its own.
+    Part(String),
+}
+
+impl LightTarget {
+    /// The object id (entity and topic suffix).
+    fn obj(&self) -> String {
+        match self {
+            LightTarget::Device => "lighting".into(),
+            LightTarget::Shared => "pc_lighting".into(),
+            LightTarget::Part(k) => format!("lighting_{}", k.replace('/', "_")),
+        }
+    }
+
+    /// The lighting it shows and changes.
+    fn get(&self, cfg: &Config, dev: &str) -> Option<crate::config::Lighting> {
+        match self {
+            LightTarget::Device => Some(cfg.lighting(dev)),
+            LightTarget::Shared => Some(cfg.lighting_sync.lighting.clone()),
+            LightTarget::Part(k) => cfg.zone_lighting.get(&format!("{dev}/{k}")).cloned(),
+        }
+    }
+
+    fn get_mut<'a>(&self, cfg: &'a mut Config, dev: &str) -> Option<&'a mut crate::config::Lighting> {
+        match self {
+            LightTarget::Device => Some(cfg.lighting_mut(dev)),
+            LightTarget::Shared => Some(&mut cfg.lighting_sync.lighting),
+            LightTarget::Part(k) => cfg.zone_lighting.get_mut(&format!("{dev}/{k}")),
+        }
+    }
+}
+
+/// The channels, fans and strips of `v` with an effect of their own:
+/// (target, entity name).
+fn part_lights(cfg: &Config, v: &DeviceView) -> Vec<(LightTarget, String)> {
+    let dev = &v.info.id;
+    let mut out = Vec::new();
+    for z in &v.zones {
+        let zkey = format!("{dev}/{}", z.id);
+        let name = cfg.zone_names.get(&zkey).cloned().unwrap_or_else(|| z.name.clone());
+        if cfg.zone_lighting.contains_key(&zkey) {
+            out.push((LightTarget::Part(z.id.clone()), format!("{name} lighting")));
+        }
+        let pieces = cfg.pieces(dev, &z.id);
+        for (k, p) in pieces.iter().enumerate() {
+            if cfg.zone_lighting.contains_key(&format!("{zkey}/{}", p.start)) {
+                let label = crate::layout::piece_label(&pieces, k);
+                out.push((LightTarget::Part(format!("{}/{}", z.id, p.start)), format!("{name} {label} lighting")));
+            }
+        }
+    }
+    out
+}
+
+/// Every light of `v`.
+fn lights_of(cfg: &Config, v: &DeviceView, any_lighting: bool) -> Vec<(LightTarget, String)> {
+    let mut out = Vec::new();
+    if !v.zones.is_empty() {
+        out.push((LightTarget::Device, "Lighting".to_string()));
+        out.extend(part_lights(cfg, v));
+    }
+    if v.info.kind == opendevicecontrol_core::DeviceKind::Computer && any_lighting {
+        out.push((LightTarget::Shared, "PC lighting".to_string()));
+    }
+    out
+}
+
+/// A light's state as Home Assistant's JSON schema has it.
+fn light_json(l: &crate::config::Lighting) -> Value {
+    let c = l.effect.primary_color().0;
+    json!({
+        "state": if l.on { "ON" } else { "OFF" },
+        "brightness": l.brightness,
+        "color_mode": "rgb",
+        "color": {"r": c.r, "g": c.g, "b": c.b},
+        "effect": l.effect.name(),
+    })
+}
+
+/// Apply a JSON schema light command:
+/// `{"state":"ON","brightness":0-100,"color":{r,g,b},"effect":".."}`.
+fn apply_light(l: &mut crate::config::Lighting, v: &Value) {
+    if let Some(s) = v.get("state").and_then(Value::as_str) {
+        l.on = s.eq_ignore_ascii_case("ON");
+    }
+    if let Some(b) = v.get("brightness").and_then(Value::as_f64) {
+        l.brightness = b.round().clamp(0.0, 100.0) as u8;
+    }
+    if let Some(e) = v.get("effect").and_then(Value::as_str).and_then(|e| l.effect.switch_to(e)) {
+        l.effect = e;
+    }
+    if let Some(col) = v.get("color") {
+        let ch = |k: &str| col.get(k).and_then(Value::as_u64).unwrap_or(0).min(255) as u8;
+        l.effect.set_color(HexColor(opendevicecontrol_core::Rgb::new(ch("r"), ch("g"), ch("b"))));
+    }
+}
+
 fn value_of(id: &str) -> String {
     format!("value_json['{id}']")
 }
@@ -177,6 +282,12 @@ fn set_status(h: &Handle, s: MqttStatus) {
     }
 }
 
+/// The computer's name, as This PC is named in Home Assistant.
+fn pc_name() -> Option<String> {
+    static NAME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| sysinfo::System::host_name().map(|h| h.trim().to_string()).filter(|h| !h.is_empty())).clone()
+}
+
 struct Topics {
     node: String,
     base: String,
@@ -184,6 +295,11 @@ struct Topics {
 }
 
 impl Topics {
+    /// A device's identifier in Home Assistant's device registry.
+    fn device_id(&self, dev: &str) -> String {
+        format!("opendevicecontrol_{}_{}", self.node, dev.replace('-', "_"))
+    }
+
     fn bridge_availability(&self) -> String {
         format!("{}/status", self.base)
     }
@@ -198,6 +314,20 @@ impl Topics {
     }
     fn light_state(&self, dev: &str) -> String {
         format!("{}/{dev}/light", self.base)
+    }
+    /// Where a light's state goes; the device's own keeps its old topic.
+    fn light_topic(&self, dev: &str, t: &LightTarget) -> String {
+        match t {
+            LightTarget::Device => self.light_state(dev),
+            other => format!("{}/{dev}/{}", self.base, other.obj()),
+        }
+    }
+    /// The command a light takes (`set/<ctrl>`).
+    fn light_ctrl(t: &LightTarget) -> String {
+        match t {
+            LightTarget::Device => "light".into(),
+            other => other.obj(),
+        }
     }
     fn key_event(&self, dev: &str, key: &str) -> String {
         format!("{}/{dev}/key/{key}", self.base)
@@ -577,25 +707,43 @@ impl<'a> Session<'a> {
         let view = self.h.shared.read().devices.get(dev).cloned();
         let Some(view) = view else { return };
         log::info!("HA command {dev}/{ctrl} = {text}");
-        if ctrl == "light" {
-            // JSON schema light: {"state":"ON","brightness":0-100,"color":{r,g,b},"effect":".."}
+        // Lights: the device's own, the PC's shared one, and channels or
+        // fans with an effect of their own.
+        let any_lighting = self.h.shared.read().devices.values().any(|d| !d.zones.is_empty());
+        let target = lights_of(&self.h.config.read(), &view, any_lighting).into_iter().map(|(t, _)| t).find(|t| Topics::light_ctrl(t) == ctrl);
+        if let Some(t) = target {
             let Ok(v) = serde_json::from_str::<Value>(text) else { return };
             self.h.update_config(|c| {
-                let l = c.lighting_mut(dev);
-                if let Some(s) = v.get("state").and_then(Value::as_str) {
-                    l.on = s.eq_ignore_ascii_case("ON");
-                }
-                if let Some(b) = v.get("brightness").and_then(Value::as_f64) {
-                    l.brightness = b.round().clamp(0.0, 100.0) as u8;
-                }
-                if let Some(e) = v.get("effect").and_then(Value::as_str).and_then(|e| l.effect.switch_to(e)) {
-                    l.effect = e;
-                }
-                if let Some(col) = v.get("color") {
-                    let ch = |k: &str| col.get(k).and_then(Value::as_u64).unwrap_or(0).min(255) as u8;
-                    l.effect.set_color(HexColor(opendevicecontrol_core::Rgb::new(ch("r"), ch("g"), ch("b"))));
+                if let Some(l) = t.get_mut(c, dev) {
+                    apply_light(l, &v);
                 }
             });
+            return;
+        }
+        if ctrl == "sync" && !view.zones.is_empty() {
+            let on = text.eq_ignore_ascii_case("ON");
+            self.h.update_config(|c| {
+                if on {
+                    if c.lighting_sync.devices.is_empty() {
+                        c.lighting_sync.lighting = c.lighting.get(dev).cloned().unwrap_or_default();
+                    }
+                    c.lighting_sync.devices.insert(dev.to_string());
+                } else {
+                    c.lighting_sync.devices.remove(dev);
+                }
+            });
+            // A device showing its built-in effect switches over to join.
+            let built_in = view
+                .controls
+                .iter()
+                .any(|c| c.id == opendevicecontrol_core::devices::SOFTWARE_LIGHTING && c.value == ControlValue::Bool(false));
+            if on && built_in {
+                let _ = self.h.cmd.send(Command::SetControl {
+                    device: dev.to_string(),
+                    id: opendevicecontrol_core::devices::SOFTWARE_LIGHTING.into(),
+                    value: ControlValue::Bool(true),
+                });
+            }
             return;
         }
         for ch in &view.fans {
@@ -632,15 +780,26 @@ impl<'a> Session<'a> {
         // This PC is named after the computer, so several PCs on one broker
         // don't all become "This PC". The app version is in `origin`;
         // `sw_version` is the device's own firmware.
+        // Everything else is shown as connected through the computer, and
+        // named after it too, so several PCs with the same parts (or one
+        // PC dual-booted) stay apart.
+        let host = pc_name();
+        let computer = v.info.kind == opendevicecontrol_core::DeviceKind::Computer;
         let name = match (&v.info.kind, &v.info.serial) {
             (opendevicecontrol_core::DeviceKind::Computer, Some(host)) if !host.is_empty() => host.clone(),
-            _ => v.info.display_name(),
+            _ => match &host {
+                Some(h) => format!("{h} {}", v.info.display_name()),
+                None => v.info.display_name(),
+            },
         };
         let mut d = json!({
-            "identifiers": [format!("opendevicecontrol_{}_{}", self.t.node, v.info.id.replace('-', "_"))],
+            "identifiers": [self.t.device_id(&v.info.id)],
             "name": name,
             "model": v.info.model,
         });
+        if !computer {
+            d["via_device"] = json!(self.t.device_id(opendevicecontrol_core::system::ID));
+        }
         if let Some(fw) = v.info.firmware.as_deref().filter(|f| !f.is_empty()) {
             d["sw_version"] = json!(fw);
         }
@@ -876,10 +1035,13 @@ impl<'a> Session<'a> {
             }
         }
         if adv.is_empty() && !self.held.keys().any(|t| t.starts_with(&format!("{}/{dev}/key/", self.t.base))) {
-            let topics = [self.t.availability(dev), self.t.state(dev), self.t.light_state(dev)];
+            // Its state topics, every light's included.
+            let own = format!("{}/{dev}/", self.t.base);
+            let mut topics = vec![self.t.availability(dev), self.t.state(dev), self.t.light_state(dev)];
+            topics.extend(self.last_light.keys().filter(|t| t.starts_with(&own) && !topics.contains(t)).cloned().collect::<Vec<_>>());
             if topics.iter().map(|t| self.send(t, "", true)).fold(true, |a, b| a & b) {
                 log::info!("MQTT: removed {dev} from Home Assistant (no longer present)");
-                self.last_light.remove(dev);
+                self.last_light.retain(|t, _| !t.starts_with(&own));
                 return true;
             }
         }
@@ -946,20 +1108,35 @@ impl<'a> Session<'a> {
             }
         }
 
-        // Lighting: one HA light per device (JSON schema).
-        if !v.zones.is_empty() {
-            let mut m = self.common(v, "lighting", "Lighting");
+        // Lights (JSON schema): the device's own, its channels and fans
+        // with an effect of their own, and on This PC the shared effect of
+        // the devices synced on the Lighting page.
+        let any_lighting = self.h.shared.read().devices.values().any(|d| !d.zones.is_empty());
+        let cfg = self.h.config.read().clone();
+        for (t, name) in lights_of(&cfg, v, any_lighting) {
+            let obj = t.obj();
+            let mut m = self.common(v, &obj, &name);
             m.remove("state_topic");
             m.insert("schema".into(), json!("json"));
-            m.insert("state_topic".into(), json!(self.t.light_state(dev)));
-            m.insert("command_topic".into(), json!(self.t.command(dev, "light")));
+            m.insert("state_topic".into(), json!(self.t.light_topic(dev, &t)));
+            m.insert("command_topic".into(), json!(self.t.command(dev, &Topics::light_ctrl(&t))));
             m.insert("brightness".into(), json!(true));
             m.insert("brightness_scale".into(), json!(100));
             m.insert("supported_color_modes".into(), json!(["rgb"]));
             m.insert("effect".into(), json!(true));
             m.insert("effect_list".into(), json!(Effect::NAMES));
-            m.insert("icon".into(), json!("mdi:led-strip-variant"));
-            out.push((self.t.discovery("light", dev, "lighting"), Value::Object(m)));
+            m.insert("icon".into(), json!(if t == LightTarget::Shared { "mdi:desktop-tower" } else { "mdi:led-strip-variant" }));
+            out.push((self.t.discovery("light", dev, &obj), Value::Object(m)));
+        }
+        // Follow PC lighting: whether the device runs the shared effect.
+        if !v.zones.is_empty() && v.info.kind != opendevicecontrol_core::DeviceKind::Computer {
+            let mut m = self.common(v, "sync", "Follow PC lighting");
+            m.insert("command_topic".into(), json!(self.t.command(dev, "sync")));
+            m.insert("value_template".into(), json!(format!("{{{{ {} }}}}", value_of("sync"))));
+            m.insert("payload_on".into(), json!("ON"));
+            m.insert("payload_off".into(), json!("OFF"));
+            m.insert("icon".into(), json!("mdi:link-variant"));
+            out.push((self.t.discovery("switch", dev, "sync"), Value::Object(m)));
         }
 
         // Keys, two entities each:
@@ -1077,6 +1254,9 @@ impl<'a> Session<'a> {
                 };
                 st.insert(c.id.clone(), val);
             }
+            if !v.zones.is_empty() {
+                st.insert("sync".into(), json!(if cfg.synced(&dev) { "ON" } else { "OFF" }));
+            }
             for ch in &v.fans {
                 let p = cfg.fan_policy(&dev, &ch.id);
                 st.insert(format!("{}_mode", ch.id), json!(p.mode_name()));
@@ -1098,26 +1278,23 @@ impl<'a> Session<'a> {
     /// Publish each device's light state when it changed (or `force`), so
     /// HA reflects changes from the GUI or brightness key right away.
     fn publish_lights(&mut self, force: bool) {
-        let devices: Vec<(String, bool)> =
-            self.h.shared.read().devices.values().map(|v| (v.info.id.clone(), !v.zones.is_empty())).collect();
+        let devices: Vec<DeviceView> = self.h.shared.read().devices.values().cloned().collect();
+        let any_lighting = devices.iter().any(|d| !d.zones.is_empty());
         let cfg = self.h.config.read().clone();
-        for (dev, has_lights) in devices {
-            // Only once its light entity is advertised on this connection.
-            let light = self.t.discovery("light", &dev, "lighting");
-            if !has_lights || !self.advertised.get(&dev).and_then(|a| a.get(&light)).is_some_and(Option::is_some) {
-                continue;
-            }
-            let l = cfg.lighting(&dev);
-            let c = l.effect.primary_color().0;
-            let st = json!({
-                "state": if l.on { "ON" } else { "OFF" },
-                "brightness": l.brightness,
-                "color_mode": "rgb",
-                "color": {"r": c.r, "g": c.g, "b": c.b},
-                "effect": l.effect.name(),
-            });
-            if (force || self.last_light.get(&dev) != Some(&st)) && self.pubj(self.t.light_state(&dev), &st, true) {
-                self.last_light.insert(dev, st);
+        for v in &devices {
+            let dev = &v.info.id;
+            for (t, _) in lights_of(&cfg, v, any_lighting) {
+                // Only once its light entity is advertised on this connection.
+                let light = self.t.discovery("light", dev, &t.obj());
+                if !self.advertised.get(dev).and_then(|a| a.get(&light)).is_some_and(Option::is_some) {
+                    continue;
+                }
+                let Some(l) = t.get(&cfg, dev) else { continue };
+                let st = light_json(&l);
+                let topic = self.t.light_topic(dev, &t);
+                if (force || self.last_light.get(&topic) != Some(&st)) && self.pubj(topic.clone(), &st, true) {
+                    self.last_light.insert(topic, st);
+                }
             }
         }
     }
@@ -1252,6 +1429,47 @@ mod tests {
         // Nothing is re-sent once accepted.
         s.publish_states(true);
         assert!(drain(&rx).iter().all(|(t, _)| !t.ends_with("/config")));
+    }
+
+    #[test]
+    fn channel_lights_and_sync_switch() {
+        let (h, _cmds) = test_handle(Config::default());
+        let mut kb = device("kb");
+        kb.zones = vec![LightZone { id: "ch2".into(), name: "ARGB 1".into(), leds: 8 }];
+        h.shared.write().devices.insert("kb".into(), kb);
+        h.config.write().zone_lighting.insert("kb/ch2".into(), Default::default());
+        let (mut s, rx) = session(&h, 4096);
+        s.publish_states(true);
+        let sent = drain(&rx);
+        let has = |t: &str| sent.iter().any(|(x, p)| x == t && !p.is_empty());
+        assert!(has(&config_topic("light", "lighting")));
+        assert!(has(&config_topic("light", "lighting_ch2")), "channel light");
+        assert!(has(&config_topic("switch", "sync")), "sync switch");
+        assert!(has(&format!("{BASE}/kb/lighting_ch2")), "channel light state");
+
+        // Commands reach the channel's own effect and the sync set.
+        s.on_command("kb", "lighting_ch2", r#"{"state":"OFF"}"#);
+        assert!(!h.config.read().zone_lighting["kb/ch2"].on);
+        s.on_command("kb", "sync", "ON");
+        assert!(h.config.read().synced("kb"));
+        s.on_command("kb", "sync", "OFF");
+        assert!(!h.config.read().synced("kb"));
+    }
+
+    #[test]
+    fn devices_hang_off_the_computer() {
+        let (h, _cmds) = test_handle(Config::default());
+        h.shared.write().devices.insert("kb".into(), device("kb"));
+        let (mut s, rx) = session(&h, 4096);
+        s.publish_states(true);
+        let sent = drain(&rx);
+        let cfg = sent.iter().find(|(t, p)| t == &config_topic("switch", "sound") && !p.is_empty()).expect("advertised");
+        let v: Value = serde_json::from_str(&cfg.1).unwrap();
+        let node = &s.t.node;
+        assert_eq!(v["device"]["via_device"], json!(format!("opendevicecontrol_{node}_this_pc")));
+        if let Some(host) = pc_name() {
+            assert!(v["device"]["name"].as_str().unwrap().starts_with(&host));
+        }
     }
 
     #[test]

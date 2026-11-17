@@ -19,12 +19,24 @@ fn env_dir(suffix: &str) -> Option<PathBuf> {
 
 /// `OPENDEVICECONTROL_CONFIG_DIR` overrides the location (portable installs, testing).
 pub fn config_dir() -> PathBuf {
+    if cfg!(test) {
+        return test_dir("config");
+    }
     env_dir("CONFIG_DIR").unwrap_or_else(|| dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("opendevicecontrol"))
 }
 
 /// `OPENDEVICECONTROL_DATA_DIR` overrides the location (portable installs, testing).
 pub fn data_dir() -> PathBuf {
+    if cfg!(test) {
+        return test_dir("data");
+    }
     env_dir("DATA_DIR").unwrap_or_else(|| dirs::data_local_dir().unwrap_or_else(|| PathBuf::from(".")).join("opendevicecontrol"))
+}
+
+/// Tests never read or write the real settings: they get a folder of
+/// their own under the temp directory.
+fn test_dir(what: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("opendevicecontrol-test-{}", std::process::id())).join(what)
 }
 
 /// One-time migration from a previous name: copy `config.toml`, `state.toml`
