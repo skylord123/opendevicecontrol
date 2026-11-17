@@ -53,6 +53,10 @@ pub const CTRL_ACTIVE_TIMEOUT: &str = "active_timeout";
 const DEFAULT_ACTIVE_MINUTES: f64 = 5.0;
 const GB: f64 = 1024.0 * 1024.0 * 1024.0;
 const MB: f64 = 1024.0 * 1024.0;
+/// Shortest window for byte and CPU rates. Counters read closer together
+/// give noise (a few ms of traffic scaled up to a second), so polls inside
+/// the window repeat the last rates.
+const MIN_RATE_WINDOW: Duration = Duration::from_secs(1);
 
 /// Source tag of the OS's own sensors (sysinfo; Linux uses hwmon's).
 #[cfg(not(target_os = "linux"))]
@@ -67,7 +71,11 @@ pub struct ThisPc {
     gpus: gpu::Gpus,
     presence: presence::Monitor,
     active_minutes: f64,
+    /// When the rate counters were last refreshed.
     last: Instant,
+    /// Length in seconds of the window the current rates cover; 0 until
+    /// the first full window.
+    rate_dt: f64,
     hardware: Vec<Hardware>,
     /// Unix time of the last input, kept steady across polls (see
     /// [`steady_since`]).
@@ -117,12 +125,19 @@ impl ThisPc {
             },
             sys,
             networks: Networks::new_with_refreshed_list(),
-            disks: Disks::new_with_refreshed_list(),
+            disks: {
+                // The first listing counts I/O since boot; a second read
+                // makes it the baseline.
+                let mut d = Disks::new_with_refreshed_list();
+                d.refresh(true);
+                d
+            },
             components: Components::new_with_refreshed_list(),
             gpus,
             presence: presence::Monitor::new(),
             active_minutes: DEFAULT_ACTIVE_MINUTES,
             last: Instant::now(),
+            rate_dt: 0.0,
             hardware: Vec::new(),
             last_input: None,
         }
@@ -287,8 +302,14 @@ impl Device for ThisPc {
     }
 
     fn poll(&mut self) -> Result<Snapshot> {
-        let dt = self.last.elapsed().as_secs_f64().max(0.001);
-        self.last = Instant::now();
+        let window = self.last.elapsed();
+        let fresh = window >= MIN_RATE_WINDOW;
+        if fresh {
+            self.rate_dt = window.as_secs_f64();
+            self.last = Instant::now();
+        }
+        let dt = self.rate_dt;
+        let rate = |bytes: u64| if dt > 0.0 { bytes as f64 / MB / dt } else { 0.0 };
         let mut t = Tree::default();
         t.node("computer", "System", HardwareKind::Computer, None);
 
@@ -296,7 +317,9 @@ impl Device for ThisPc {
         self.presence_sensors(&mut t);
 
         // CPU.
-        self.sys.refresh_cpu_all();
+        if fresh {
+            self.sys.refresh_cpu_all();
+        }
         let cpus = self.sys.cpus();
         let brand = cpus.first().map(|c| c.brand().trim().to_string()).filter(|b| !b.is_empty()).unwrap_or_else(|| "CPU".into());
         t.node("cpu", &brand, HardwareKind::Cpu, None);
@@ -347,7 +370,9 @@ impl Device for ThisPc {
         self.gpus.read(&mut t);
 
         // Disks: space per volume, throughput overall.
-        self.disks.refresh(true);
+        if fresh {
+            self.disks.refresh(true);
+        }
         t.node("drives", "Drives", HardwareKind::Storage, None);
         let (mut rd, mut wr) = (0u64, 0u64);
         let mut d = Vec::new();
@@ -368,16 +393,18 @@ impl Device for ThisPc {
             let used = (total - free) / total * 100.0;
             d.push(Sensor::new(&format!("disk_{key}_load"), &format!("Disk {label} usage"), SensorKind::Load, used).icon("mdi:harddisk"));
             d.push(Sensor::new(&format!("disk_{key}_free"), &format!("Disk {label} free"), SensorKind::DataSize, free / GB).extra());
-            d.push(Sensor::new(&format!("disk_{key}_read"), &format!("Disk {label} read"), SensorKind::DataRate, u.read_bytes as f64 / MB / dt).extra());
-            d.push(Sensor::new(&format!("disk_{key}_write"), &format!("Disk {label} write"), SensorKind::DataRate, u.written_bytes as f64 / MB / dt).extra());
+            d.push(Sensor::new(&format!("disk_{key}_read"), &format!("Disk {label} read"), SensorKind::DataRate, rate(u.read_bytes)).extra());
+            d.push(Sensor::new(&format!("disk_{key}_write"), &format!("Disk {label} write"), SensorKind::DataRate, rate(u.written_bytes)).extra());
         }
-        d.push(Sensor::new("disk_read", "Disk read", SensorKind::DataRate, rd as f64 / MB / dt));
-        d.push(Sensor::new("disk_write", "Disk write", SensorKind::DataRate, wr as f64 / MB / dt));
+        d.push(Sensor::new("disk_read", "Disk read", SensorKind::DataRate, rate(rd)));
+        d.push(Sensor::new("disk_write", "Disk write", SensorKind::DataRate, rate(wr)));
         t.extend("drives", d.into_iter().map(|s| s.from_source("sysinfo")));
 
         // Network: all interfaces except loopback, and each one that has
         // carried traffic.
-        self.networks.refresh(true);
+        if fresh {
+            self.networks.refresh(true);
+        }
         t.node("network", "Network", HardwareKind::Network, None);
         let (mut rx, mut tx) = (0u64, 0u64);
         let mut per = Vec::new();
@@ -395,8 +422,8 @@ impl Device for ThisPc {
         t.extend(
             "network",
             [
-                Sensor::new("net_down", "Network download", SensorKind::DataRate, rx as f64 / MB / dt).icon("mdi:download-network"),
-                Sensor::new("net_up", "Network upload", SensorKind::DataRate, tx as f64 / MB / dt).icon("mdi:upload-network"),
+                Sensor::new("net_down", "Network download", SensorKind::DataRate, rate(rx)).icon("mdi:download-network"),
+                Sensor::new("net_up", "Network upload", SensorKind::DataRate, rate(tx)).icon("mdi:upload-network"),
             ],
         );
         per.sort();
@@ -406,8 +433,8 @@ impl Device for ThisPc {
             t.extend(
                 &id,
                 [
-                    Sensor::new(&format!("{id}_down"), "Download", SensorKind::DataRate, r as f64 / MB / dt).extra(),
-                    Sensor::new(&format!("{id}_up"), "Upload", SensorKind::DataRate, x as f64 / MB / dt).extra(),
+                    Sensor::new(&format!("{id}_down"), "Download", SensorKind::DataRate, rate(r)).extra(),
+                    Sensor::new(&format!("{id}_up"), "Upload", SensorKind::DataRate, rate(x)).extra(),
                     Sensor::new(&format!("{id}_downloaded"), "Data downloaded", SensorKind::DataSize, tr as f64 / GB).extra(),
                     Sensor::new(&format!("{id}_uploaded"), "Data uploaded", SensorKind::DataSize, tt as f64 / GB).extra(),
                 ]

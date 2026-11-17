@@ -81,7 +81,13 @@ fn probe() {
     probe_temperatures();
     match opendevicecontrol_core::discover(&[]) {
         Ok(devs) if devs.is_empty() => println!("No supported Corsair devices found."),
-        Ok(devs) => {
+        Ok(mut devs) => {
+            // Rates (network, disk, CPU load) need a window between two
+            // readings, so read once, wait, and print the second reading.
+            for (_, d) in devs.iter_mut() {
+                let _ = d.poll();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1100));
             for (_, mut d) in devs {
                 let i = d.info().clone();
                 println!("{} {} ({:04x}:{:04x}) id={}", i.manufacturer, i.model, i.usb_vid, i.usb_pid, i.id);
