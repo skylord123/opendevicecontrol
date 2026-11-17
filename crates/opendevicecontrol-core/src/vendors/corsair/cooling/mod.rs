@@ -145,7 +145,7 @@ pub(super) fn discover(api: &hidapi::HidApi, list: &[&hidapi::DeviceInfo], skip:
             } else {
                 continue;
             };
-            if skip.iter().any(|p| p.as_c_str() == d.path()) {
+            if super::taken(d.path(), skip, out) {
                 continue;
             }
             let id = ids.next(slug);

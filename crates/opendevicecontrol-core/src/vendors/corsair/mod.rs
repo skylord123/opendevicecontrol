@@ -19,12 +19,25 @@ pub mod void;
 // Shared with the driver modules (`super::Ids`, `super::Device`).
 pub(crate) use crate::devices::{Device, Ids};
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 
 /// Corsair's USB vendor ID.
 pub const VID: u16 = 0x1b1c;
 
 type Opened = Vec<(CString, Box<dyn Device>)>;
+
+/// Whether `path` is held by the caller or was already opened in this scan.
+/// On Linux several collections share one hidraw path, so one device can
+/// match more than once.
+pub(crate) fn taken(path: &CStr, skip: &[CString], out: &Opened) -> bool {
+    skip.iter().any(|p| p.as_c_str() == path) || out.iter().any(|(p, _)| p.as_c_str() == path)
+}
+
+/// `list` without repeated paths, keeping the first entry of each.
+pub(crate) fn unique_paths<'a>(list: impl IntoIterator<Item = &'a hidapi::DeviceInfo>) -> Vec<&'a hidapi::DeviceInfo> {
+    let mut seen = std::collections::HashSet::new();
+    list.into_iter().filter(|d| seen.insert(d.path())).collect()
+}
 
 /// The serial number of `d`, if it reports a non-blank one.
 pub(crate) fn serial_of(d: &hidapi::DeviceInfo) -> Option<&str> {
@@ -83,7 +96,7 @@ pub(crate) fn discover(
     // HXi / RMi power supplies: one HID interface each.
     for d in list.iter().filter(|d| hxi::model_for_pid(d.product_id()).is_some()) {
         let model = hxi::model_for_pid(d.product_id()).unwrap();
-        if skip_paths.iter().any(|p| p.as_c_str() == d.path()) {
+        if taken(d.path(), skip_paths, out) {
             continue;
         }
         let id = ids.next(model.slug);
@@ -100,12 +113,12 @@ pub(crate) fn discover(
     // collections on interface 0 (vendor pages, carrying the key bitmap).
     for d in list.iter().filter(|d| nxp::model_for_pid(d.product_id()).is_some_and(|m| nxp::is_command_interface(m, d))) {
         let model = nxp::model_for_pid(d.product_id()).unwrap();
-        if skip_paths.iter().any(|p| p.as_c_str() == d.path()) {
+        if taken(d.path(), skip_paths, out) {
             continue;
         }
         let id = ids.next(model.slug);
         let units = count_units(&list, |c| c.product_id() == d.product_id() && nxp::is_command_interface(model, c));
-        let input_paths: Vec<&hidapi::DeviceInfo> = list.iter().filter(|i| nxp::is_input_interface(model, d, i, units)).copied().collect();
+        let input_paths = unique_paths(list.iter().copied().filter(|i| nxp::is_input_interface(model, d, i, units)));
         let inputs: Vec<hidapi::HidDevice> = input_paths
             .iter()
             .filter_map(|i| match api.open_path(i.path()) {

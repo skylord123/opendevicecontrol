@@ -190,8 +190,11 @@ pub fn discover(held: &[(CString, String)]) -> Result<Vec<(CString, Box<dyn Devi
     let mut list: Vec<&hidapi::DeviceInfo> = api.device_list().collect();
     // Stable order so duplicate ids are assigned consistently.
     list.sort_by(|a, b| a.path().cmp(b.path()));
+    // Drop entries listed twice, but keep every top-level collection: on
+    // Linux all collections of an interface share one hidraw path, and the
+    // drivers match on the collection's usage page.
     let mut seen = std::collections::HashSet::new();
-    list.retain(|d| seen.insert(d.path().to_owned()));
+    list.retain(|d| seen.insert((d.path().to_owned(), d.usage_page(), d.usage())));
 
     let mut ids = Ids::reserving(held.iter().map(|(_, id)| id.clone()));
     let mut out: Vec<(CString, Box<dyn Device>)> = Vec::new();

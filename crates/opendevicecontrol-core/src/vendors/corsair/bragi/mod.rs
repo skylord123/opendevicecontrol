@@ -647,14 +647,14 @@ fn open_bus(api: &hidapi::HidApi, path: &CStr, first_size: usize, prefix: Option
 /// Vendor event interfaces (interface 2) of the same physical device, with
 /// `units` units of this model plugged in (see [`super::same_unit`]).
 fn event_interfaces(api: &hidapi::HidApi, list: &[&hidapi::DeviceInfo], d: &hidapi::DeviceInfo, units: usize) -> Vec<hidapi::HidDevice> {
-    list.iter()
-        .filter(|i| {
+    super::unique_paths(list.iter().copied().filter(|i| {
             i.product_id() == d.product_id()
                 && i.interface_number() == 2
                 && i.usage_page() >= 0xff00
                 && super::same_unit(super::serial_of(i), super::serial_of(d), units)
                 && i.path() != d.path()
-        })
+        }))
+        .into_iter()
         .filter_map(|i| api.open_path(i.path()).map_err(|e| log::debug!("bragi event interface: {e}")).ok())
         .collect()
 }
