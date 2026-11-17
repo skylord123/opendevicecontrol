@@ -388,7 +388,7 @@ impl FerroApp {
             });
             let ui = &mut cols[1];
             if let Some(m) = macros.get_mut(st.macro_selected) {
-                macro_steps(ui, m, info, &mut st.recording);
+                macro_steps(ui, m, info.macro_max_steps, &mut st.recording);
             }
         });
         let changed = macros != saved_full;
@@ -607,8 +607,9 @@ fn step_of_kind(k: usize) -> MacroAction {
     }
 }
 
-/// Name, steps and recording for one macro.
-fn macro_steps(ui: &mut egui::Ui, m: &mut Macro, info: &KeymapInfo, recording: &mut Option<Recording>) {
+/// Name, steps and recording for one macro. `max_steps` caps the length (the
+/// device's limit for an on-device macro, or a program limit for the library).
+fn macro_steps(ui: &mut egui::Ui, m: &mut Macro, max_steps: usize, recording: &mut Option<Recording>) {
     ui.horizontal(|ui| {
         ui.label("Name");
         ui.add(egui::TextEdit::singleline(&mut m.name).desired_width(160.0).char_limit(16));
@@ -628,7 +629,7 @@ fn macro_steps(ui: &mut egui::Ui, m: &mut Macro, info: &KeymapInfo, recording: &
         }
     });
     if let Some(r) = recording {
-        record_input(ui, m, r, info.macro_max_steps);
+        record_input(ui, m, r, max_steps);
         ui.ctx().request_repaint();
     }
     egui::ScrollArea::vertical().id_salt("macro_steps").max_height(260.0).show(ui, |ui| {
@@ -679,9 +680,72 @@ fn macro_steps(ui: &mut egui::Ui, m: &mut Macro, info: &KeymapInfo, recording: &
             m.steps.remove(i);
         }
     });
-    if m.steps.len() < info.macro_max_steps && ui.button("+ Add step").clicked() {
+    if m.steps.len() < max_steps && ui.button("+ Add step").clicked() {
         m.steps.push(MacroStep { action: MacroAction::KeyDown(0x04), delay_ms: 20 });
     }
+}
+
+/// Step limit for a program (library) macro, which has no device to fit in.
+pub(crate) const LIBRARY_MAX_STEPS: usize = 128;
+
+/// State for the program macro-library editor (which macro is selected, a
+/// recording in progress, and the unsaved draft list).
+#[derive(Default)]
+pub(crate) struct MacroLibState {
+    selected: usize,
+    recording: Option<Recording>,
+    draft: Option<Vec<Macro>>,
+}
+
+/// The program macro library editor, reused for keyboards that play macros in
+/// software (the K55 and similar). Returns the new list when the user saves.
+pub(crate) fn macro_library(ui: &mut egui::Ui, st: &mut MacroLibState, saved: &[Macro]) -> Option<Vec<Macro>> {
+    let mut macros = st.draft.clone().unwrap_or_else(|| saved.to_vec());
+    let mut result = None;
+
+    ui.horizontal_wrapped(|ui| {
+        for (i, m) in macros.iter().enumerate() {
+            let label = if m.name.is_empty() { format!("Macro {}", i + 1) } else { m.name.clone() };
+            ui.selectable_value(&mut st.selected, i, label);
+        }
+        if ui.button("+ New").clicked() {
+            macros.push(Macro::default());
+            st.selected = macros.len() - 1;
+            st.recording = None;
+        }
+    });
+    if st.selected >= macros.len() {
+        st.selected = macros.len().saturating_sub(1);
+    }
+
+    let mut delete = false;
+    if let Some(m) = macros.get_mut(st.selected) {
+        macro_steps(ui, m, LIBRARY_MAX_STEPS, &mut st.recording);
+        ui.add_space(4.0);
+        if ui.button(RichText::new("Delete this macro").color(WARN)).clicked() {
+            delete = true;
+        }
+    } else {
+        ui.label(RichText::new("No macros yet. Click \"+ New\", then Record and type the sequence.").weak());
+    }
+    if delete {
+        macros.remove(st.selected);
+        st.recording = None;
+    }
+
+    let changed = macros.as_slice() != saved;
+    ui.horizontal(|ui| {
+        if ui.add_enabled(changed, egui::Button::new(RichText::new("Save macros").strong())).clicked() {
+            result = Some(macros.clone());
+            st.recording = None;
+        }
+        if changed && ui.button("Revert").clicked() {
+            macros = saved.to_vec();
+            st.recording = None;
+        }
+    });
+    st.draft = if result.is_none() && macros.as_slice() != saved { Some(macros) } else { None };
+    result
 }
 
 /// Turn key presses in the window into macro steps, with their timing.

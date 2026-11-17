@@ -111,8 +111,15 @@ Tested on an **HX850i** (Windows 11). The other models use the same protocol.
 
 - Lighting: static, breathing, colour cycle, rainbow wave, colour wave;
   brightness (the brightness key cycles 100 → 66 → 33 → off); live preview.
-- **G1–G6 and MR** can press a hotkey, type text, launch a program/file/URL or
-  send a media key. Every press is also a Home Assistant event.
+- **G1–G6 and MR** can press a hotkey, type text, launch a program/file/URL,
+  send a media key, or play a recorded **macro**. Every press is also a Home
+  Assistant event.
+- **Macros** are recorded and kept in OpenDeviceControl (the K55 does not store
+  macros on the keyboard), then assigned to a key with the *Macro* action.
+  Record one on the keyboard's page: click Record and type the sequence, which
+  captures the keystrokes and their timing.
+- **Brightness** (the keyboard's own level, 0 to 100 %) is a control and
+  follows the brightness key.
 - **Win lock** disables the Windows key, and optionally Alt+Tab, Alt+F4 and
   Shift+Tab. The lock key and Home Assistant toggle it.
 - On exit the keyboard returns to its built-in lighting and keys.

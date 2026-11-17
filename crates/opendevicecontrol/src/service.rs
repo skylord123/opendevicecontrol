@@ -1041,7 +1041,16 @@ fn on_key(h: &Handle, device: &str, key: &str, pressed: bool) {
     if pressed {
         log::debug!("{device}: {key} pressed");
         let action = h.config.read().key_action(device, key);
-        crate::inject::run(action);
+        // A "Macro" action names a macro in the library; resolve it to its
+        // steps and play those. Everything else runs directly.
+        if let crate::config::KeyAction::Macro { name } = &action {
+            let m = h.config.read().macros.iter().find(|m| &m.name == name).cloned();
+            if let Some(m) = m {
+                crate::inject::run_macro(m);
+            }
+        } else {
+            crate::inject::run(action);
+        }
         h.notify();
     }
     h.notify_key(&KeyEvent { device: device.into(), key: key.into(), pressed });

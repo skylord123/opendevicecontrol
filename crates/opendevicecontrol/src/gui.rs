@@ -41,6 +41,8 @@ pub struct FerroApp {
     pub(crate) charts: HashMap<String, (String, Vec<String>)>,
     /// Unsaved key-action edits per "device/key".
     pub(crate) key_drafts: HashMap<String, crate::config::KeyAction>,
+    /// State of the program macro-library editor on keyboard pages.
+    pub(crate) macro_lib: crate::gui_keymap::MacroLibState,
     /// Time range of the history chart, seconds.
     pub(crate) range_secs: f64,
     /// The Sensors page graph: (device, sensor) pairs.
@@ -258,6 +260,7 @@ impl FerroApp {
             show_password: false,
             charts: HashMap::new(),
             key_drafts: HashMap::new(),
+            macro_lib: Default::default(),
             range_secs: 900.0,
             sensors_chart: Vec::new(),
             sensors_chart_init: false,

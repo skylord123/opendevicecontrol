@@ -7,7 +7,9 @@
 
 use crate::config::KeyAction;
 use crossbeam_channel::Sender;
+use opendevicecontrol_core::keymap::{modifier, Macro, MacroAction};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 /// (name, Windows virtual-key code, extended-key flag, Linux evdev code)
 const KEYS: &[(&str, u16, bool, u16)] = &[
@@ -123,6 +125,59 @@ pub fn key(name: &str) -> Option<Key> {
     None
 }
 
+/// A keyboard HID usage code (page 7, as macros store them) to a [`Key`].
+/// Covers the keys the macro recorder can produce.
+pub fn hid_to_key(usage: u8) -> Option<Key> {
+    let name: String = match usage {
+        0x04..=0x1d => ((b'a' + (usage - 0x04)) as char).to_string(),
+        0x1e..=0x26 => ((b'1' + (usage - 0x1e)) as char).to_string(),
+        0x27 => "0".into(),
+        0x28 => "enter".into(),
+        0x29 => "esc".into(),
+        0x2a => "backspace".into(),
+        0x2b => "tab".into(),
+        0x2c => "space".into(),
+        0x2d => "-".into(),
+        0x2e => "=".into(),
+        0x2f => "[".into(),
+        0x30 => "]".into(),
+        0x31 => "\\".into(),
+        0x33 => ";".into(),
+        0x34 => "'".into(),
+        0x35 => "`".into(),
+        0x36 => ",".into(),
+        0x37 => ".".into(),
+        0x38 => "/".into(),
+        0x39 => "capslock".into(),
+        0x3a..=0x45 => format!("f{}", usage - 0x39),
+        0x49 => "insert".into(),
+        0x4a => "home".into(),
+        0x4b => "pageup".into(),
+        0x4c => "delete".into(),
+        0x4d => "end".into(),
+        0x4e => "pagedown".into(),
+        0x4f => "right".into(),
+        0x50 => "left".into(),
+        0x51 => "down".into(),
+        0x52 => "up".into(),
+        0x68..=0x73 => format!("f{}", usage - 0x68 + 13),
+        _ => return None,
+    };
+    key(&name)
+}
+
+/// A modifier bit (see [`modifier`]) to its key. Left and right map the same.
+fn modifier_key(bit: u8) -> Option<Key> {
+    let name = match bit {
+        modifier::LCTRL | 0x10 => "ctrl",
+        modifier::LSHIFT | 0x20 => "shift",
+        modifier::LALT | 0x40 => "alt",
+        modifier::LGUI | 0x80 => "win",
+        _ => return None,
+    };
+    key(name)
+}
+
 /// Parse `ctrl+shift+esc` into keys. Errors name the unknown part.
 pub fn parse_hotkey(s: &str) -> Result<Vec<Key>, String> {
     let parts: Vec<&str> = s.split('+').map(str::trim).filter(|p| !p.is_empty()).collect();
@@ -134,16 +189,13 @@ pub fn parse_hotkey(s: &str) -> Result<Vec<Key>, String> {
 
 enum Job {
     Action(KeyAction),
+    Macro(Macro),
 }
 
 static WORKER: OnceLock<Sender<Job>> = OnceLock::new();
 
-/// Run a key action in the background (actions never block device I/O).
-pub fn run(action: KeyAction) {
-    if matches!(action, KeyAction::None) {
-        return;
-    }
-    let tx = WORKER.get_or_init(|| {
+fn worker() -> &'static Sender<Job> {
+    WORKER.get_or_init(|| {
         let (tx, rx) = crossbeam_channel::unbounded::<Job>();
         std::thread::Builder::new()
             .name("opendevicecontrol-macros".into())
@@ -151,16 +203,69 @@ pub fn run(action: KeyAction) {
                 // A unit struct on Windows, not on Linux.
                 #[allow(clippy::default_constructed_unit_structs)]
                 let mut backend = imp::Backend::default();
-                for Job::Action(a) in rx {
-                    if let Err(e) = execute(&mut backend, &a) {
-                        log::warn!("key action {a:?} failed: {e}");
+                for job in rx {
+                    let r = match &job {
+                        Job::Action(a) => execute(&mut backend, a),
+                        Job::Macro(m) => play_macro(&mut backend, m),
+                    };
+                    if let Err(e) = r {
+                        match &job {
+                            Job::Action(a) => log::warn!("key action {a:?} failed: {e}"),
+                            Job::Macro(m) => log::warn!("macro '{}' failed: {e}", m.name),
+                        }
                     }
                 }
             })
             .expect("spawn macro thread");
         tx
-    });
-    let _ = tx.send(Job::Action(action));
+    })
+}
+
+/// Run a key action in the background (actions never block device I/O).
+/// A [`KeyAction::Macro`] carries only a name, so resolve it to a [`Macro`]
+/// and use [`run_macro`] instead; here it does nothing.
+pub fn run(action: KeyAction) {
+    if matches!(action, KeyAction::None | KeyAction::Macro { .. }) {
+        return;
+    }
+    let _ = worker().send(Job::Action(action));
+}
+
+/// Play a recorded macro in the background.
+pub fn run_macro(m: Macro) {
+    if m.steps.is_empty() {
+        return;
+    }
+    let _ = worker().send(Job::Macro(m));
+}
+
+/// Play a macro's steps with their timing, then release any modifiers left
+/// held so a half-recorded macro cannot stick a key down.
+fn play_macro(b: &mut imp::Backend, m: &Macro) -> Result<(), String> {
+    let mut first_err = None;
+    for step in &m.steps {
+        let r = match step.action {
+            MacroAction::KeyDown(u) => hid_to_key(u).ok_or_else(|| format!("unknown key usage {u:#04x}")).and_then(|k| b.down(&k)),
+            MacroAction::KeyUp(u) => hid_to_key(u).ok_or_else(|| format!("unknown key usage {u:#04x}")).and_then(|k| b.up(&k)),
+            MacroAction::ModifierDown(x) => modifier_key(x).ok_or_else(|| format!("unknown modifier {x:#04x}")).and_then(|k| b.down(&k)),
+            MacroAction::ModifierUp(x) => modifier_key(x).ok_or_else(|| format!("unknown modifier {x:#04x}")).and_then(|k| b.up(&k)),
+            // Mouse steps are not played in software yet (keyboard only).
+            _ => Ok(()),
+        };
+        if let Err(e) = r {
+            first_err.get_or_insert(e);
+        }
+        if step.delay_ms > 0 {
+            std::thread::sleep(Duration::from_millis(step.delay_ms as u64));
+        }
+    }
+    // Safety net: drop every modifier.
+    for bit in [modifier::LCTRL, modifier::LSHIFT, modifier::LALT, modifier::LGUI] {
+        if let Some(k) = modifier_key(bit) {
+            let _ = b.up(&k);
+        }
+    }
+    first_err.map_or(Ok(()), Err)
 }
 
 fn execute(b: &mut imp::Backend, a: &KeyAction) -> Result<(), String> {
@@ -173,6 +278,8 @@ fn execute(b: &mut imp::Backend, a: &KeyAction) -> Result<(), String> {
         KeyAction::Media { key: k } => b.chord(&[key(k).ok_or_else(|| format!("unknown media key '{k}'"))?]),
         KeyAction::Text { text } => b.text(text),
         KeyAction::Launch { command } => launch(command),
+        // Resolved to a macro and played through run_macro.
+        KeyAction::Macro { .. } => Ok(()),
     }
 }
 
@@ -229,6 +336,16 @@ mod imp {
             let mut v: Vec<INPUT> = keys.iter().map(|k| kb(k.vk, 0, ext(k))).collect();
             v.extend(keys.iter().rev().map(|k| kb(k.vk, 0, ext(k) | KEYEVENTF_KEYUP)));
             send(&v)
+        }
+
+        pub fn down(&mut self, k: &Key) -> Result<(), String> {
+            let ext = if k.extended { KEYEVENTF_EXTENDEDKEY } else { 0 };
+            send(&[kb(k.vk, 0, ext)])
+        }
+
+        pub fn up(&mut self, k: &Key) -> Result<(), String> {
+            let ext = if k.extended { KEYEVENTF_EXTENDEDKEY } else { 0 };
+            send(&[kb(k.vk, 0, ext | KEYEVENTF_KEYUP)])
         }
 
         pub fn text(&mut self, text: &str) -> Result<(), String> {
@@ -294,6 +411,14 @@ mod imp {
             let mut ev: Vec<(u16, i32)> = keys.iter().map(|k| (k.evdev, 1)).collect();
             ev.extend(keys.iter().rev().map(|k| (k.evdev, 0)));
             self.key_events(&ev)
+        }
+
+        pub fn down(&mut self, k: &Key) -> Result<(), String> {
+            self.key_events(&[(k.evdev, 1)])
+        }
+
+        pub fn up(&mut self, k: &Key) -> Result<(), String> {
+            self.key_events(&[(k.evdev, 0)])
         }
 
         pub fn text(&mut self, text: &str) -> Result<(), String> {
@@ -375,6 +500,12 @@ mod imp {
         pub fn text(&mut self, _: &str) -> Result<(), String> {
             Err("key actions are not supported on this OS".into())
         }
+        pub fn down(&mut self, _: &Key) -> Result<(), String> {
+            Err("key actions are not supported on this OS".into())
+        }
+        pub fn up(&mut self, _: &Key) -> Result<(), String> {
+            Err("key actions are not supported on this OS".into())
+        }
     }
 }
 
@@ -391,5 +522,24 @@ mod tests {
         assert_eq!(key("f1").unwrap().evdev, 59);
         assert_eq!(key("a").unwrap().evdev, 30);
         assert!(parse_hotkey("ctrl+nope").is_err());
+    }
+
+    #[test]
+    fn hid_usages_map_to_keys() {
+        // Letters, digits, function keys and a few specials the recorder emits.
+        assert_eq!(hid_to_key(0x04), key("a"));
+        assert_eq!(hid_to_key(0x1d), key("z"));
+        assert_eq!(hid_to_key(0x1e), key("1"));
+        assert_eq!(hid_to_key(0x27), key("0"));
+        assert_eq!(hid_to_key(0x28), key("enter"));
+        assert_eq!(hid_to_key(0x2c), key("space"));
+        assert_eq!(hid_to_key(0x3a), key("f1"));
+        assert_eq!(hid_to_key(0x45), key("f12"));
+        assert_eq!(hid_to_key(0x68), key("f13"));
+        assert_eq!(hid_to_key(0x52), key("up"));
+        assert!(hid_to_key(0x00).is_none());
+        // Modifiers, left and right.
+        assert_eq!(modifier_key(modifier::LCTRL), key("ctrl"));
+        assert_eq!(modifier_key(0x80), key("win"));
     }
 }

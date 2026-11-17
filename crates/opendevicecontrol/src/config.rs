@@ -201,6 +201,11 @@ pub struct Config {
     /// `"<device id>/<zone id>/<start LED>"` for a fan or strip on it.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub zone_lighting: BTreeMap<String, Lighting>,
+    /// Macros the user recorded, each played by a key assigned the "Macro"
+    /// action. Kept in the program: the K55 and similar keyboards do not
+    /// store macros on the device, so playback is in software.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub macros: Vec<opendevicecontrol_core::keymap::Macro>,
 }
 
 /// Devices that follow one shared effect (the Lighting page) instead of
@@ -720,10 +725,12 @@ pub enum KeyAction {
     Launch { command: String },
     /// A media key.
     Media { key: String },
+    /// Play a saved macro from the library (referenced by its name).
+    Macro { name: String },
 }
 
 impl KeyAction {
-    pub const NAMES: [&'static str; 5] = ["None", "Hotkey", "Text", "Launch", "Media"];
+    pub const NAMES: [&'static str; 6] = ["None", "Hotkey", "Text", "Launch", "Media", "Macro"];
 
     pub fn name(&self) -> &'static str {
         match self {
@@ -732,6 +739,7 @@ impl KeyAction {
             KeyAction::Text { .. } => "Text",
             KeyAction::Launch { .. } => "Launch",
             KeyAction::Media { .. } => "Media",
+            KeyAction::Macro { .. } => "Macro",
         }
     }
 
@@ -741,6 +749,7 @@ impl KeyAction {
             "Text" => KeyAction::Text { text: String::new() },
             "Launch" => KeyAction::Launch { command: String::new() },
             "Media" => KeyAction::Media { key: "play_pause".into() },
+            "Macro" => KeyAction::Macro { name: String::new() },
             _ => KeyAction::None,
         }
     }

@@ -1035,9 +1035,24 @@ impl FerroApp {
                                         }
                                     });
                                 }
+                                KeyAction::Macro { name } => {
+                                    let names: Vec<String> =
+                                        self.h.config.read().macros.iter().map(|m| m.name.clone()).filter(|n| !n.is_empty()).collect();
+                                    if names.is_empty() {
+                                        ui.label(RichText::new("Record and name a macro below first").weak());
+                                    } else {
+                                        let shown = if name.is_empty() { "Pick a macro".into() } else { name.clone() };
+                                        egui::ComboBox::from_id_salt(("macro", &key)).selected_text(shown).show_ui(ui, |ui| {
+                                            for n in &names {
+                                                ui.selectable_value(name, n.clone(), n);
+                                            }
+                                        });
+                                    }
+                                }
                             }
                             let invalid = match &*draft {
                                 KeyAction::Hotkey { keys } => crate::inject::parse_hotkey(keys).err(),
+                                KeyAction::Macro { name } if name.is_empty() => Some("choose a macro".to_string()),
                                 _ => None,
                             };
                             ui.horizontal(|ui| {
@@ -1065,6 +1080,21 @@ impl FerroApp {
                         .small()
                         .weak(),
                     );
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.label(RichText::new("Macros").strong());
+                    ui.label(
+                        RichText::new(
+                            "Record a sequence of keystrokes and give it a name, then assign it to a key above with the \
+                             \"Macro\" action. Macros are stored in OpenDeviceControl and played in software.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    let saved_macros = self.h.config.read().macros.clone();
+                    if let Some(new) = crate::gui_keymap::macro_library(ui, &mut self.macro_lib, &saved_macros) {
+                        self.h.update_config(|c| c.macros = new);
+                    }
                 });
                 ui.add_space(6.0);
             }
