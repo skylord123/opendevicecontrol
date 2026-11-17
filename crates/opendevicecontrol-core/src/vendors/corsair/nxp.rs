@@ -171,6 +171,9 @@ pub struct NxpModel {
     pub win_lock: WinLock,
     /// Send `07 05 08 00 01` after entering software mode (OpenRGB).
     pub lighting_08: bool,
+    /// `07 05 02 00 n` sets a 0-3 brightness level (verified on the K55; the
+    /// firmware scales software colours by it too). See docs/reverse-engineering.md.
+    pub brightness: bool,
     /// STRAFE side lights (`07 05 08 00 on`), exposed as a toggle.
     pub side_lights: bool,
     /// Poll rate adjustable with `07 0A` (ckb-next `SUPPORTS_ADJRATE`).
@@ -213,7 +216,11 @@ pub const CTRL_LOCK_ALT_TAB: &str = "lock_alt_tab";
 pub const CTRL_LOCK_ALT_F4: &str = "lock_alt_f4";
 pub const CTRL_LOCK_SHIFT_TAB: &str = "lock_shift_tab";
 pub const CTRL_SIDE_LIGHTS: &str = "side_lights";
+pub const CTRL_BRIGHTNESS: &str = "brightness";
 pub const CTRL_POLL_RATE: &str = "poll_rate";
+
+/// K55 hardware brightness levels (`07 05 02 00 n`), dim to bright.
+const BRIGHTNESS_LEVELS: [(u8, &str); 4] = [(0, "Off"), (1, "33%"), (2, "66%"), (3, "100%")];
 pub const CTRL_DPI_STAGE: &str = "dpi_stage";
 pub const CTRL_SNIPER_DPI: &str = "dpi_sniper";
 pub const CTRL_ANGLE_SNAP: &str = "angle_snap";
@@ -410,6 +417,8 @@ pub struct NxpDevice {
     lock_alt_f4: bool,
     lock_shift_tab: bool,
     side_lights: bool,
+    /// K55 hardware brightness level 0-3 (`brightness` models only).
+    brightness: u8,
     /// Poll interval in ms, if known.
     poll_ms: Option<u8>,
     dpi: [u16; DPI_STAGES + 1],
@@ -459,6 +468,7 @@ impl NxpDevice {
             lock_alt_f4: true,
             lock_shift_tab: false,
             side_lights: true,
+            brightness: 3,
             poll_ms: None,
             dpi: DEFAULT_DPI,
             dpi_rgb: [Rgb::WHITE; DPI_STAGES + 1],
@@ -475,6 +485,17 @@ impl NxpDevice {
                 d.poll_ms = Some(info[16]);
             }
             d.layout = KbLayout::from_info(info[23]);
+            // K55: the device-info reply carries the live brightness level in
+            // byte 24 (the brightness key cycles it). Keep what the keyboard
+            // last showed instead of forcing full brightness.
+            if model.brightness && info[24] <= 3 {
+                d.brightness = info[24];
+            }
+        }
+        // K55: read the current key-lock state so we keep it on takeover
+        // rather than unlocking (`0E 48`, see docs/reverse-engineering.md).
+        if model.win_lock == WinLock::Performance {
+            d.read_key_locks();
         }
         (d.zones, d.led_map) = build_zones(model, d.layout);
         if model.max_dpi > 0 {
@@ -560,6 +581,28 @@ impl NxpDevice {
         }
     }
 
+    /// Read the K55's key-lock flags (`0E 48`); reply byte 2 packs bit0 Win,
+    /// bit1 Alt+Tab, bit2 Alt+F4, bit3 Shift+Tab. The "also blocks" sub-flags
+    /// only mean anything while Win lock is on, so seed them only then and
+    /// otherwise keep our defaults.
+    fn read_key_locks(&mut self) {
+        if let Some(r) = self.query(&[0x0e, 0x48], 3) {
+            let f = r[2];
+            self.win_lock = f & 0x01 != 0;
+            if self.win_lock {
+                self.lock_alt_tab = f & 0x02 != 0;
+                self.lock_alt_f4 = f & 0x04 != 0;
+                self.lock_shift_tab = f & 0x08 != 0;
+            }
+        }
+    }
+
+    /// K55 brightness level (`07 05 02 00 n`). Sent on top of the verified
+    /// software-mode sequence so that sequence stays byte-for-byte unchanged.
+    fn apply_brightness(&self) -> Result<()> {
+        self.write(&[0x07, 0x05, 0x02, 0x00, self.brightness])
+    }
+
     fn is_keyboard(&self) -> bool {
         self.model.kind == DeviceKind::Keyboard
     }
@@ -585,6 +628,9 @@ impl NxpDevice {
         }
         self.write_key_table(&software_key_table(self.model))?;
         self.apply_key_locks()?;
+        if self.model.brightness {
+            self.apply_brightness()?;
+        }
         self.last_colors.clear();
         Ok(())
     }
@@ -761,6 +807,17 @@ impl Device for NxpDevice {
         if self.model.side_lights {
             controls.push(self.toggle(CTRL_SIDE_LIGHTS, "Side lights", self.side_lights, "The light strips on the sides."));
         }
+        if self.model.brightness {
+            controls.push(Control {
+                id: CTRL_BRIGHTNESS.into(),
+                name: "Brightness".into(),
+                kind: ControlKind::Choice { options: BRIGHTNESS_LEVELS.iter().map(|(_, n)| (*n).to_string()).collect() },
+                value: ControlValue::Choice(
+                    BRIGHTNESS_LEVELS.iter().find(|(n, _)| *n == self.brightness).map_or("100%", |(_, n)| n).to_string(),
+                ),
+                help: Some("Hardware brightness, also changed by the keyboard's brightness key.".into()),
+            });
+        }
         if self.model.max_dpi > 0 {
             let dpi = |id: String, name: String, v: u16| Control {
                 id,
@@ -826,6 +883,10 @@ impl Device for NxpDevice {
                 self.side_lights = *v;
                 Ok(())
             }
+            (CTRL_BRIGHTNESS, ControlValue::Choice(c)) if self.model.brightness => {
+                let (level, _) = BRIGHTNESS_LEVELS.iter().find(|(_, n)| n == c).ok_or_else(invalid)?;
+                set_if_applied(self, |d| &mut d.brightness, *level, |d| d.apply_brightness())
+            }
             (CTRL_ANGLE_SNAP, ControlValue::Bool(v)) if self.model.max_dpi > 0 => {
                 self.write(&[0x07, 0x13, 0x04, 0x00, *v as u8, 0x05])?;
                 self.angle_snap = *v;
@@ -857,8 +918,8 @@ impl Device for NxpDevice {
             }
             // A known control with a value of the wrong type.
             (
-                CTRL_WIN_LOCK | CTRL_LOCK_ALT_TAB | CTRL_LOCK_ALT_F4 | CTRL_LOCK_SHIFT_TAB | CTRL_SIDE_LIGHTS | CTRL_ANGLE_SNAP
-                | CTRL_DPI_STAGE | CTRL_POLL_RATE,
+                CTRL_WIN_LOCK | CTRL_LOCK_ALT_TAB | CTRL_LOCK_ALT_F4 | CTRL_LOCK_SHIFT_TAB | CTRL_SIDE_LIGHTS | CTRL_BRIGHTNESS
+                | CTRL_ANGLE_SNAP | CTRL_DPI_STAGE | CTRL_POLL_RATE,
                 _,
             ) => Err(invalid()),
             _ => Err(Error::UnknownControl(id.into())),

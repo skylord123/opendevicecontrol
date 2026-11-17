@@ -102,6 +102,7 @@ const KEYBOARD: NxpModel = NxpModel {
     keys: &[],
     win_lock: WinLock::Lock48,
     lighting_08: false,
+    brightness: false,
     side_lights: false,
     poll_rate: false,
     max_dpi: 0,
@@ -160,6 +161,7 @@ pub static MODELS: &[NxpModel] = &[
         keys: K55_KEYS,
         win_lock: WinLock::Performance,
         lighting_08: true,
+        brightness: true,
         ..KEYBOARD
     },
     // ---- per-key keyboards (ckb-next IS_FULLRANGE decides 9- vs 24-bit) ----
