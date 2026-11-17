@@ -45,7 +45,7 @@ pub(crate) fn same_unit(a: Option<&str>, b: Option<&str>, units: usize) -> bool 
 }
 
 /// Identifies one USB interface: on Windows each top-level collection of an
-/// interface gets its own path (`...&Col02#8&2d26f0b9&0&0001#{guid}`), so
+/// interface gets its own path (`...&Col02#8&1a2b3c4d&0&0001#{guid}`), so
 /// the collection parts are dropped; elsewhere the path already names one
 /// interface.
 pub(crate) fn interface_key(path: &std::ffi::CStr) -> String {
@@ -161,8 +161,8 @@ mod tests {
     #[test]
     fn windows_collections_share_an_interface_key() {
         let k = |p: &str| interface_key(&CString::new(p).unwrap());
-        let c1 = k(r"\\?\HID#VID_1B1C&PID_1B2D&MI_01&Col01#8&2d26f0b9&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}");
-        let c2 = k(r"\\?\HID#VID_1B1C&PID_1B2D&MI_01&Col02#8&2d26f0b9&0&0001#{4d1e55b2-f16f-11cf-88cb-001111000030}");
+        let c1 = k(r"\\?\HID#VID_1B1C&PID_1B2D&MI_01&Col01#8&1a2b3c4d&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}");
+        let c2 = k(r"\\?\HID#VID_1B1C&PID_1B2D&MI_01&Col02#8&1a2b3c4d&0&0001#{4d1e55b2-f16f-11cf-88cb-001111000030}");
         let other_unit = k(r"\\?\HID#VID_1B1C&PID_1B2D&MI_01&Col01#8&11aa22bb&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}");
         assert_eq!(c1, c2);
         assert_ne!(c1, other_unit);

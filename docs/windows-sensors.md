@@ -25,7 +25,7 @@ read: HWiNFO when it shares its sensors.
 
 | Source | What it gives | Requires |
 |---|---|---|
-| OS (`sysinfo`) | whatever Windows reports (usually nothing) | — |
+| OS (`sysinfo`) | whatever Windows reports (usually nothing) | - |
 | **OpenDeviceControl sensor service** | CPU temperatures, power, clocks and VIDs; the motherboard's Nuvoton / ITE / Fintek chip and ASUS EC sensors; memory module temperatures (through PawnIO); drive health (SMART / NVMe) | the service, set up by the installer |
 | PawnIO in OpenDeviceControl itself | the same | **opt-in**, PawnIO installed, module file, OpenDeviceControl **as administrator** |
 | HWiNFO | every sensor it shows | HWiNFO running, *Shared Memory Support* on |
@@ -216,7 +216,7 @@ the .NET 10 build), so current versions are read through their web server:
 `GET http://127.0.0.1:<port>/data.json` (HTTP/1.0, 200 ms connect timeout),
 walking the tree of hardware nodes (`HardwareId`, e.g. `/amdcpu/0`,
 `/lpc/nct6799d/0` under `/motherboard`) and sensors (`SensorId`, `Type`,
-and `RawValue` — a number or "4749312.0 B/s" in the base unit — or the
+and `RawValue` (a number or "4749312.0 B/s" in the base unit), or the
 formatted `Value` on versions without `RawValue`). Types Temperature,
 Voltage, Current, Power, Clock, Load, Level, Control, Fan, Flow, Data,
 SmallData, Throughput and TimeSpan are used (Factor, Timing and Noise are

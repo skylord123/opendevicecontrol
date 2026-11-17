@@ -1,4 +1,4 @@
-# Corsair RGB memory (SMBus) — design and safety
+# Corsair RGB memory (SMBus): design and safety
 
 Status: **experimental, untested on hardware.** Disabled by default.
 
@@ -58,7 +58,7 @@ convention:
    *less* (listed in §3.5).
 5. **Only the chipset SMBus controllers.** Like OpenRGB's `IF_DRAM_SMBUS`
    macro, we only look at Intel i801-family and AMD FCH (PIIX4) SMBus
-   controllers, identified by PCI vendor/device ID — never GPU DDC/I²C,
+   controllers, identified by PCI vendor/device ID, never GPU DDC/I²C,
    display, or other buses.
 6. **Volatile only.** We use the controllers' *direct* (streaming) colour
    mode only. We never write the effect configuration (register `0x82`),
@@ -141,7 +141,7 @@ below. Otherwise the address is not used for anything further.
 | `0x0B00`, `0x0B01` | Vengeance RGB RS DDR5 | 6 | no |
 
 **Direct colour mode** (protocol version ≥ 4 only; OpenRGB refuses direct
-mode below that, so do we — such modules get temperature only):
+mode below that, so do we: such modules get temperature only):
 
 ```
 packet = [led_count, R0, G0, B0, R1, G1, B1, …, crc8(packet[0 .. n-1])]
@@ -192,7 +192,7 @@ RGB module (the device *is* the Corsair memory kit).
 ### 3.4 Bus access pattern
 
 - Detection runs once when RAM support is enabled (and again on *Rescan
-  devices*); there is no periodic probing — DIMMs are not hot-pluggable.
+  devices*); there is no periodic probing, since DIMMs are not hot-pluggable.
 - 10 ms pause between probed addresses (as OpenRGB).
 - Animated effects send ~30 frames/s. Each DIMM costs one (two for 12-LED
   modules) 32-byte block write, ≈3–4 ms at 100 kHz; frames identical to the
@@ -227,7 +227,7 @@ and one temperature sensor per DIMM**, rather than one device per DIMM:
   the bus handle, so transfers are naturally serialised (no locking between
   workers) and an effect frame for all sticks goes out back-to-back.
 - Effects flow across the whole kit (rainbow wave over four sticks), with one
-  lighting setting and one Home Assistant `light` entity — what users expect
+  lighting setting and one Home Assistant `light` entity, which is what users expect
   from a matched RAM kit, and what iCUE shows.
 - A kit is bought, installed and removed as a unit; per-DIMM firmware
   versions and models are still shown in the zone names / log.
@@ -312,7 +312,7 @@ the SMBus controller's I/O ports.
 
 ### What opendevicecontrol implements
 
-`smbus::pawnio` — a PawnIO backend, loaded dynamically (no build- or
+`smbus::pawnio`: a PawnIO backend, loaded dynamically (no build- or
 run-time dependency when RAM support is off):
 
 - loads `PawnIOLib.dll` from the PawnIO install directory
@@ -352,7 +352,7 @@ exposes a **narrow** named-pipe API to the unprivileged app:
 - `list` → identified Corsair DIMMs (address, model, LED count) and temperatures;
 - `set_colors(dimm, [rgb; n])` → builds the packet itself.
 
-It must **never** offer raw SMBus reads/writes to the pipe client — that
+It must **never** offer raw SMBus reads/writes to the pipe client; that
 would re-create the WinRing0 privilege-escalation hole for any local user.
 The pipe ACL allows interactive users; the service enforces the same
 identification and deny-list rules as the in-process code (they live in

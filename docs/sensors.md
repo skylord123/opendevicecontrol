@@ -43,7 +43,7 @@ hour kept in memory.
 
 A PC has hundreds of sensors; Home Assistant gets only those you choose.
 
-* **Default:** everything OpenDeviceControl has always sent — presence, CPU load and
+* **Default:** everything OpenDeviceControl has always sent: presence, CPU load and
   `cpu_temp`, memory, GPU, disks, network, uptime, the Linux kernel's
   temperatures (`temp_*`, up to 32) and every sensor of every other device.
   Their entity ids are unchanged.
