@@ -78,9 +78,8 @@ what each OS can read and how, are in [sensors.md](sensors.md) and
 Presence sensors for Home Assistant:
 
 - **Locked:** whether the session is locked (Windows: the real session lock,
-  so a UAC prompt doesn't count; Linux: logind's lock hint). The desktop's
-  lock screen has to set that hint: GNOME and KDE do, but COSMIC doesn't
-  yet, so there *Locked* stays off.
+  so a UAC prompt doesn't count; Linux: logind's lock hint, which GNOME and
+  KDE set, or on COSMIC the lock file its lock screen keeps while locked).
 - **Last input:** when the keyboard or mouse was last used (Windows:
   `GetLastInputInfo`; Linux: GNOME's idle monitor, the compositor's
   `ext-idle-notify` on COSMIC, KDE and wlroots desktops, else logind's idle

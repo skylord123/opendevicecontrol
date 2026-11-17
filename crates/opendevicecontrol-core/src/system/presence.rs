@@ -4,7 +4,9 @@
 //! * Windows: lock state from `WTSQuerySessionInformation(WTSSessionInfoEx)`
 //!   (the session's real lock flag, so a UAC prompt is not "locked"); idle
 //!   time from `GetLastInputInfo`.
-//! * Linux: logind (`LockedHint`, `IdleHint`/`IdleSinceHint`) over D-Bus;
+//! * Linux: logind (`LockedHint`, `IdleHint`/`IdleSinceHint`) over D-Bus.
+//!   COSMIC's lock screen doesn't set `LockedHint`, but keeps
+//!   `$XDG_RUNTIME_DIR/cosmic-greeter-<session id>.lock` while locked;
 //!   on GNOME, Mutter's idle monitor gives the exact time since last input;
 //!   on other Wayland desktops (COSMIC, KDE, wlroots) the compositor's
 //!   `ext-idle-notify-v1` does. Elsewhere `IdleHint` is the fallback, and
@@ -97,6 +99,9 @@ mod imp {
         system: Option<Connection>,
         session: Option<Connection>,
         session_path: Option<String>,
+        /// The lock file COSMIC's lock screen keeps while the session is
+        /// locked (it doesn't set `LockedHint`).
+        cosmic_lock: Option<std::path::PathBuf>,
         /// Mutter's idle monitor answered at least once (GNOME).
         mutter: Option<bool>,
     }
@@ -105,6 +110,7 @@ mod imp {
         pub fn new() -> Self {
             let mut m = Monitor { system: Connection::system().ok(), session: Connection::session().ok(), ..Default::default() };
             m.session_path = m.find_session();
+            m.cosmic_lock = m.cosmic_lock_file();
             if m.session_path.is_none() {
                 log::info!("presence: no logind session found; lock/idle state unavailable");
             }
@@ -128,6 +134,17 @@ mod imp {
             let up = Proxy::new(conn, LOGIN1, user.as_str(), "org.freedesktop.login1.User").ok()?;
             let (_, path): (String, zbus::zvariant::OwnedObjectPath) = up.get_property("Display").ok()?;
             (path.as_str() != "/").then(|| path.as_str().to_string())
+        }
+
+        /// `cosmic-greeter-<id>.lock` in our runtime directory. The session
+        /// id comes from logind, as a systemd user service has no
+        /// `XDG_SESSION_ID`.
+        fn cosmic_lock_file(&self) -> Option<std::path::PathBuf> {
+            let id: String = self.session_proxy()?.get_property("Id").ok()?;
+            let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from(format!("/run/user/{}", unsafe { getuid() })));
+            Some(runtime.join(format!("cosmic-greeter-{id}.lock")))
         }
 
         fn session_proxy(&self) -> Option<Proxy<'_>> {
@@ -163,7 +180,9 @@ mod imp {
         }
 
         pub fn read(&mut self) -> Presence {
-            let locked = self.session_proxy().and_then(|p| p.get_property::<bool>("LockedHint").ok());
+            let hint = self.session_proxy().and_then(|p| p.get_property::<bool>("LockedHint").ok());
+            let cosmic = self.cosmic_lock.as_ref().is_some_and(|f| f.exists());
+            let locked = if cosmic { Some(true) } else { hint };
             let idle_secs = self.mutter_idle().or_else(wayland_idle::idle_secs).or_else(|| {
                 let p = self.session_proxy()?;
                 if !p.get_property::<bool>("IdleHint").ok()? {
