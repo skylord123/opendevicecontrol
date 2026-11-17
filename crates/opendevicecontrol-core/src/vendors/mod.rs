@@ -6,3 +6,4 @@ pub mod asrock;
 pub mod asus;
 pub mod aula;
 pub mod corsair;
+pub mod system76;

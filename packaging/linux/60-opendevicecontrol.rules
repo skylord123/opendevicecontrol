@@ -22,5 +22,10 @@ SUBSYSTEM=="i2c-dev", KERNEL=="i2c-[0-9]*", ATTRS{name}=="SMBus PIIX4 adapter*",
 # the i2c-dev module. Delete this line if you don't use it.
 SUBSYSTEM=="i2c-dev", KERNEL=="i2c-[0-9]*", ATTRS{name}=="NVIDIA i2c adapter 1 *", TAG+="uaccess"
 
+# System76 laptop keyboard backlight: brightness and colour. LEDs have no
+# device node to give the desktop user, so only these attributes are made
+# writable (any local user can then change the keyboard's colour).
+ACTION=="add|change", SUBSYSTEM=="leds", KERNEL=="system76*::kbd_backlight", RUN+="/bin/sh -c 'cd /sys%p && chmod a+w brightness color color_left color_center color_right color_extra 2>/dev/null; true'"
+
 # Virtual keyboard for key actions
 KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"

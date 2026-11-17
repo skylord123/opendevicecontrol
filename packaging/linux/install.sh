@@ -28,6 +28,7 @@ echo "==> installing udev rule (sudo)"
 sudo install -Dm644 "$HERE/60-opendevicecontrol.rules" /etc/udev/rules.d/60-opendevicecontrol.rules
 sudo udevadm control --reload-rules
 sudo udevadm trigger --subsystem-match=hidraw
+sudo udevadm trigger --subsystem-match=leds
 if [ -f "$HERE/modules-load.d/opendevicecontrol-i2c.conf" ]; then
     echo "==> loading i2c-dev at boot (RAM lighting, only used if enabled in Settings)"
     sudo install -Dm644 "$HERE/modules-load.d/opendevicecontrol-i2c.conf" /etc/modules-load.d/opendevicecontrol-i2c.conf

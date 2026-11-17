@@ -40,6 +40,9 @@ pub enum Error {
     Offline,
     #[error("not supported by this device{0}")]
     NotSupported(&'static str),
+    /// Reading or writing a kernel attribute (Linux sysfs).
+    #[error("{0}")]
+    Sysfs(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

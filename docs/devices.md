@@ -19,6 +19,7 @@ Every device also appears in Home Assistant; see
 | **Aula F99** keyboard (2.4 GHz receiver or USB cable) | `3554:fa09`, `258a:010c` | ✅ per-key and sound-reactive lighting, built-in effects, battery, key remapping, macros, OS mode, Win-key lock, sleep, debounce. Bluetooth: not supported |
 | **ASRock Polychrome RGB** (motherboard lighting on recent ASRock boards) | `26ce:01a2` | ✅ every zone and addressable header, OpenDeviceControl and sound-reactive lighting, all 18 built-in effects with any colour, apply to all channels, LED counts |
 | **ASUS GeForce RTX 4070 Ti SUPER** lighting (PCI `10de:2705`, subsystem `1043:8957`) | n/a | ✅ all 4 LEDs, OpenDeviceControl and sound-reactive lighting, 14 built-in effects with colour, speed and direction. Linux: 🧪 same protocol, not yet tested on hardware |
+| **System76 laptop keyboards** with an RGB backlight (tested: Gazelle `gaze15`) | n/a | ✅ colour and brightness, OpenDeviceControl and sound-reactive lighting. Linux only |
 | K65 RGB / LUX RGB / RGB RAPIDFIRE keyboards | `1b1c:1b17, 1b37, 1b39` | 🧪 per-key lighting, special keys, Win lock |
 | K68 RGB keyboard | `1b1c:1b4f` | 🧪 per-key lighting, special keys, Win lock, polling rate |
 | K70 RGB / LUX RGB / RGB RAPIDFIRE keyboards | `1b1c:1b13, 1b33, 1b38` | 🧪 per-key lighting, special keys, Win lock |
@@ -190,6 +191,24 @@ only talks to cards it knows.
   the lighting controller).
 - Close Armoury Crate, GPU Tweak or OpenRGB first: two programs driving the
   card at once fight over it.
+
+## System76 laptop keyboards
+
+The RGB keyboard backlight of System76 laptops, through the `system76` /
+`system76_acpi` kernel drivers that Pop!_OS ships. Tested on a Gazelle
+(`gaze15`), a single-colour RGB keyboard; models with one `color`
+attribute or several colour zones are handled the same way, as one zone.
+
+- **Colour and brightness** as controls (also in Home Assistant). The Fn
+  keys still work and the controls follow them.
+- **OpenDeviceControl lighting:** off by default. When on, effects, sync
+  and sound-reactive lighting drive the backlight; a colour's brightness
+  becomes the backlight's. Turning it off, or quitting, puts back what the
+  keyboard showed before.
+- **Linux only.** On Windows the backlight goes through Clevo's own driver,
+  which isn't supported.
+- Needs the udev rule shipped in `packaging/linux`, which makes just the
+  backlight's brightness and colour attributes writable.
 
 ## Sound-reactive lighting
 
