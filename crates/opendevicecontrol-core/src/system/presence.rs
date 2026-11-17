@@ -5,8 +5,10 @@
 //!   (the session's real lock flag, so a UAC prompt is not "locked"); idle
 //!   time from `GetLastInputInfo`.
 //! * Linux: logind (`LockedHint`, `IdleHint`/`IdleSinceHint`) over D-Bus;
-//!   on GNOME, Mutter's idle monitor gives the exact time since last input.
-//!   How promptly `IdleHint` is set depends on the desktop.
+//!   on GNOME, Mutter's idle monitor gives the exact time since last input;
+//!   on other Wayland desktops (COSMIC, KDE, wlroots) the compositor's
+//!   `ext-idle-notify-v1` does. Elsewhere `IdleHint` is the fallback, and
+//!   how promptly it is set depends on the desktop.
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Presence {
@@ -162,7 +164,7 @@ mod imp {
 
         pub fn read(&mut self) -> Presence {
             let locked = self.session_proxy().and_then(|p| p.get_property::<bool>("LockedHint").ok());
-            let idle_secs = self.mutter_idle().or_else(|| {
+            let idle_secs = self.mutter_idle().or_else(wayland_idle::idle_secs).or_else(|| {
                 let p = self.session_proxy()?;
                 if !p.get_property::<bool>("IdleHint").ok()? {
                     return Some(0.0);
@@ -173,6 +175,94 @@ mod imp {
                 Some(now.saturating_sub(since) as f64 / 1_000_000.0)
             });
             Presence { locked, idle_secs }
+        }
+    }
+
+    /// Time since the last input from the Wayland compositor
+    /// (`ext-idle-notify-v1`), watched by one thread for the whole process.
+    mod wayland_idle {
+        use std::sync::{Arc, LazyLock, Mutex};
+        use std::time::{Duration, Instant};
+        use wayland_client::globals::{registry_queue_init, GlobalListContents};
+        use wayland_client::protocol::{wl_registry, wl_seat::WlSeat};
+        use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
+        use wayland_protocols::ext::idle_notify::v1::client::ext_idle_notification_v1::{self, ExtIdleNotificationV1};
+        use wayland_protocols::ext::idle_notify::v1::client::ext_idle_notifier_v1::ExtIdleNotifierV1;
+
+        /// The shortest idle timeout worth asking for; idle time is
+        /// reported from then on.
+        const TIMEOUT: Duration = Duration::from_secs(1);
+
+        #[derive(Default)]
+        struct Idle {
+            /// The compositor connection is still being watched.
+            alive: bool,
+            /// When input stopped, while idle.
+            since: Option<Instant>,
+        }
+
+        type Shared = Arc<Mutex<Idle>>;
+
+        static WATCH: LazyLock<Option<Shared>> = LazyLock::new(start);
+
+        /// Seconds since the last input, or `None` when the compositor
+        /// doesn't offer `ext-idle-notify-v1` (GNOME, X11, no session).
+        pub(super) fn idle_secs() -> Option<f64> {
+            let idle = WATCH.as_ref()?.lock().ok()?;
+            idle.alive.then(|| idle.since.map_or(0.0, |t| t.elapsed().as_secs_f64()))
+        }
+
+        struct State(Shared);
+
+        impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
+            fn event(_: &mut Self, _: &wl_registry::WlRegistry, _: wl_registry::Event, _: &GlobalListContents, _: &Connection, _: &QueueHandle<Self>) {}
+        }
+        impl Dispatch<WlSeat, ()> for State {
+            fn event(_: &mut Self, _: &WlSeat, _: <WlSeat as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+        }
+        impl Dispatch<ExtIdleNotifierV1, ()> for State {
+            fn event(_: &mut Self, _: &ExtIdleNotifierV1, _: <ExtIdleNotifierV1 as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+        }
+        impl Dispatch<ExtIdleNotificationV1, ()> for State {
+            fn event(state: &mut Self, _: &ExtIdleNotificationV1, event: ext_idle_notification_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+                let mut idle = state.0.lock().unwrap_or_else(|e| e.into_inner());
+                match event {
+                    ext_idle_notification_v1::Event::Idled => idle.since = Some(Instant::now() - TIMEOUT),
+                    ext_idle_notification_v1::Event::Resumed => idle.since = None,
+                    _ => {}
+                }
+            }
+        }
+
+        fn start() -> Option<Shared> {
+            std::env::var_os("WAYLAND_DISPLAY")?;
+            let conn = Connection::connect_to_env().ok()?;
+            let (globals, mut queue) = registry_queue_init::<State>(&conn).ok()?;
+            let qh = queue.handle();
+            let seat: WlSeat = globals.bind(&qh, 1..=1, ()).ok()?;
+            let notifier: ExtIdleNotifierV1 = globals.bind(&qh, 1..=2, ()).ok()?;
+            let ms = TIMEOUT.as_millis() as u32;
+            // Version 2 ignores idle inhibitors (a playing video), which
+            // matters for "is someone at the keyboard".
+            let notification = if notifier.version() >= 2 {
+                notifier.get_input_idle_notification(ms, &seat, &qh, ())
+            } else {
+                notifier.get_idle_notification(ms, &seat, &qh, ())
+            };
+            let shared: Shared = Arc::new(Mutex::new(Idle { alive: true, since: None }));
+            let mut state = State(shared.clone());
+            queue.roundtrip(&mut state).ok()?;
+            log::info!("presence: idle time from the Wayland compositor (ext-idle-notify v{})", notifier.version());
+            std::thread::Builder::new()
+                .name("wayland-idle".into())
+                .spawn(move || {
+                    let _keep = (seat, notifier, notification);
+                    while queue.blocking_dispatch(&mut state).is_ok() {}
+                    log::info!("presence: Wayland connection closed; idle time from logind");
+                    state.0.lock().unwrap_or_else(|e| e.into_inner()).alive = false;
+                })
+                .ok()?;
+            Some(shared)
         }
     }
 
