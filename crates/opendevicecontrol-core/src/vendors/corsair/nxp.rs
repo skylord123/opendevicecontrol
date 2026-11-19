@@ -172,7 +172,7 @@ pub struct NxpModel {
     /// Send `07 05 08 00 01` after entering software mode (OpenRGB).
     pub lighting_08: bool,
     /// `07 05 02 00 n` sets a 0-3 brightness level (verified on the K55; the
-    /// firmware scales software colours by it too). See docs/reverse-engineering.md.
+    /// firmware scales software colours by it too). See docs/reverse-engineering/corsair-k55.md.
     pub brightness: bool,
     /// STRAFE side lights (`07 05 08 00 on`), exposed as a toggle.
     pub side_lights: bool,
@@ -493,7 +493,7 @@ impl NxpDevice {
             }
         }
         // K55: read the current key-lock state so we keep it on takeover
-        // rather than unlocking (`0E 48`, see docs/reverse-engineering.md).
+        // rather than unlocking (`0E 48`, see docs/reverse-engineering/corsair-k55.md).
         if model.win_lock == WinLock::Performance {
             d.read_key_locks();
         }
