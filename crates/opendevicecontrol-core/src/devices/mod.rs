@@ -200,6 +200,7 @@ pub fn discover(held: &[(CString, String)]) -> Result<Vec<(CString, Box<dyn Devi
     let mut out: Vec<(CString, Box<dyn Device>)> = Vec::new();
     crate::vendors::corsair::discover(&api, &list, &mut ids, skip_paths, &mut out);
     crate::vendors::aula::discover(&api, &list, &mut ids, skip_paths, &mut out);
+    crate::vendors::speedlink::discover(&api, &list, &mut ids, skip_paths, &mut out);
     crate::vendors::asrock::discover(&api, &list, &mut ids, skip_paths, &mut out);
     crate::vendors::asus::discover(&mut ids, skip_paths, &mut out);
     crate::vendors::system76::discover(&mut ids, skip_paths, &mut out);

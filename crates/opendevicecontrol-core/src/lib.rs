@@ -43,6 +43,22 @@ pub enum Error {
     /// Reading or writing a kernel attribute (Linux sysfs).
     #[error("{0}")]
     Sysfs(String),
+    /// Anything else, already worded for the user.
+    #[error("{0}")]
+    Other(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+static STATE_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Where drivers may keep state a device can't report back (for example
+/// the keymap of a keyboard that can only be written). Set once by the
+/// front-end at start-up; without it such state lives for the session only.
+pub fn set_state_dir(dir: std::path::PathBuf) {
+    let _ = STATE_DIR.set(dir);
+}
+
+pub(crate) fn state_dir() -> Option<&'static std::path::Path> {
+    STATE_DIR.get().map(|p| p.as_path())
+}

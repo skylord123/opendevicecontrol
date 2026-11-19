@@ -167,6 +167,9 @@ fn main() {
     let instance = single_instance::SingleInstance::new(&format!("opendevicecontrol-{}", config::sanitize_id(&user)));
     let other_running = matches!(&instance, Ok(i) if !i.is_single());
     init_logging(has(&["-v", "--verbose"]), !other_running);
+    // Where drivers keep what a device can't report back (e.g. the keymap
+    // of keyboards that are write-only).
+    opendevicecontrol_core::set_state_dir(config::data_dir().join("device-state"));
     if other_running {
         if has(&["--probe"]) {
             eprintln!("OpenDeviceControl is running and owns the devices; quit it first (opendevicecontrol --quit) to probe them.");

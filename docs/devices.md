@@ -20,6 +20,7 @@ Every device also appears in Home Assistant; see
 | **ASRock Polychrome RGB** (motherboard lighting on recent ASRock boards) | `26ce:01a2` | ✅ every zone and addressable header, OpenDeviceControl and sound-reactive lighting, all 18 built-in effects with any colour, apply to all channels, LED counts |
 | **ASUS GeForce RTX 4070 Ti SUPER** lighting (PCI `10de:2705`, subsystem `1043:8957`) | n/a | ✅ all 4 LEDs, OpenDeviceControl and sound-reactive lighting, 14 built-in effects with colour, speed and direction. Linux: 🧪 same protocol, not yet tested on hardware |
 | **System76 laptop keyboards** with an RGB backlight (tested: Gazelle `gaze15`) | n/a | ✅ colour and brightness, OpenDeviceControl and sound-reactive lighting. Linux only |
+| **Speedlink ACCUSOR** keyboard (SL-670005-BK) | `264a:3008` | ✅ profiles, backlight level and colour, key remapping on all 3 profiles, macros stored in the keyboard, OpenDeviceControl keys |
 | K65 RGB / LUX RGB / RGB RAPIDFIRE keyboards | `1b1c:1b17, 1b37, 1b39` | 🧪 per-key lighting, special keys, Win lock |
 | K68 RGB keyboard | `1b1c:1b4f` | 🧪 per-key lighting, special keys, Win lock, polling rate |
 | K70 RGB / LUX RGB / RGB RAPIDFIRE keyboards | `1b1c:1b13, 1b33, 1b38` | 🧪 per-key lighting, special keys, Win lock |
@@ -215,6 +216,35 @@ attribute or several colour zones are handled the same way, as one zone.
   which isn't supported.
 - Needs the udev rule shipped in `packaging/linux`, which makes just the
   backlight's brightness and colour attributes writable.
+
+## Speedlink ACCUSOR
+
+A membrane gaming keyboard with M1–M6 macro keys, P1–P3 profile keys and a
+single-colour backlight. It reports itself as a "Tt eSPORTS CHALLENGER Prime
+RGB", the OEM board it is built on; OpenDeviceControl only takes boards that
+answer the ACCUSOR's profile query. Protocol notes:
+[reverse-engineering/speedlink-accusor.md](reverse-engineering/speedlink-accusor.md).
+
+- **Profiles:** the keyboard stores three. Pick one in the app or with P1–P3;
+  the app follows the keys.
+- **Backlight:** off, 25 %, 50 %, 100 % or breathing, in red, blue or purple,
+  per profile. There is no other colour and no per-key lighting, so
+  OpenDeviceControl effects don't apply. Fn+Scroll Lock switches the light off
+  and on by itself; while it is off, the app's setting has no visible effect.
+- **Key remapping** on each profile: keys, media keys, mouse buttons, macros,
+  the keyboard's own functions (profile keys, F-keys with their Fn extras,
+  the gaming-mode WASD/arrow keys), or an *OpenDeviceControl key* that runs an
+  action or goes to Home Assistant. A key sends one key; for a shortcut such
+  as Ctrl+C, record a macro.
+- **Macros:** 18, up to 63 presses and releases each, played by the keyboard
+  itself.
+- The keyboard can't report its keys, macros or lighting, so the app shows
+  what it last saved (or the factory setup) and keeps that copy in its data
+  folder.
+- Not available: polling rate (the official driver's command has no
+  effect; Fn+F3/F4 still work), Win-key lock (Fn+Win), key response time
+  (Fn+F1/F2), gaming mode (Fn+Print Screen).
+- Linux needs the udev rule shipped in `packaging/linux`.
 
 ## Sound-reactive lighting
 

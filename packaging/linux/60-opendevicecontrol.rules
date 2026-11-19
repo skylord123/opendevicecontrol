@@ -9,6 +9,9 @@ SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1b1c", TAG+="uaccess"
 SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3554", ATTRS{idProduct}=="fa09", TAG+="uaccess"
 SUBSYSTEM=="hidraw", ATTRS{idVendor}=="258a", ATTRS{idProduct}=="010c", TAG+="uaccess"
 
+# Speedlink ACCUSOR keyboard (reports itself as a Tt eSPORTS CHALLENGER Prime)
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="264a", ATTRS{idProduct}=="3008", TAG+="uaccess"
+
 # Corsair RGB memory (experimental; only used when enabled in opendevicecontrol
 # Settings): the chipset SMBus adapters only (Intel i801, AMD PIIX4), never
 # GPU/display I2C buses. Needs the i2c-dev module. This gives the desktop
