@@ -24,3 +24,4 @@ The driver code is under `crates/opendevicecontrol-core/src/vendors/`.
 - [ASRock Polychrome RGB (USB)](asrock-polychrome.md): USB protocol for ASRock Polychrome RGB controllers.
 - [ASUS Aura (ENE) lighting](asus-aura.md): ENE-based ASUS Aura lighting over I2C.
 - [Aula F99 keyboard](aula-f99.md): notes on the Aula F99 keyboard protocol.
+- [Speedlink ACCUSOR keyboard](speedlink-accusor.md): feature commands, key table, onboard macros and events, recovered from the Windows driver and tested on hardware.
