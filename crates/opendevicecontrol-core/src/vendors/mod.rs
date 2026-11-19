@@ -4,6 +4,7 @@
 
 pub mod asrock;
 pub mod asus;
+pub mod bose;
 pub mod aula;
 pub mod corsair;
 pub mod speedlink;
