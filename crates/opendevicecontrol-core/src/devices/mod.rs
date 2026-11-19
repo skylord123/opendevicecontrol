@@ -43,6 +43,15 @@ pub trait Device: Send {
         Vec::new()
     }
 
+    /// Whether the front-end may re-apply the last value of every toggle
+    /// when the device is opened again (for settings the hardware forgets,
+    /// such as a Win lock). False for devices that keep their own settings
+    /// and can be changed elsewhere too, where restoring would undo those
+    /// changes, or where a toggle is an action (connect a paired device).
+    fn restore_toggles(&self) -> bool {
+        true
+    }
+
     fn fan_channels(&self) -> Vec<FanChannel> {
         Vec::new()
     }

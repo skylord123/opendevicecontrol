@@ -720,7 +720,7 @@ fn worker(h: Handle, state: Arc<Mutex<State>>, mut dev: Box<dyn Device>, rx: Rec
     );
 
     // Re-apply remembered toggles (Win lock etc.).
-    {
+    if dev.restore_toggles() {
         let cfg = h.config.read().clone();
         if let Ok(snap) = dev.poll() {
             for c in snap.controls.iter().filter(|c| c.kind == ControlKind::Toggle) {
