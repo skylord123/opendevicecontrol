@@ -31,7 +31,8 @@ it to Home Assistant. Nothing did all of that, so I wrote OpenDeviceControl.
 **[Supported devices →](docs/devices.md)** Corsair power supplies, keyboards,
 mice, headsets, coolers and RAM, the Aula F99 keyboard, ASRock motherboard
 lighting, ASUS graphics card lighting, System76 laptop keyboards, the
-Speedlink ACCUSOR keyboard, and the PC's own sensors.
+Speedlink ACCUSOR keyboard, Bose headphones over Bluetooth, and the PC's own
+sensors.
 
 > Not affiliated with or endorsed by Corsair or any other device maker.
 > "Corsair", "iCUE" and "HXi" are trademarks of Corsair Gaming, Inc.

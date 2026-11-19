@@ -21,6 +21,8 @@ Every device also appears in Home Assistant; see
 | **ASUS GeForce RTX 4070 Ti SUPER** lighting (PCI `10de:2705`, subsystem `1043:8957`) | n/a | ✅ all 4 LEDs, OpenDeviceControl and sound-reactive lighting, 14 built-in effects with colour, speed and direction. Linux: 🧪 same protocol, not yet tested on hardware |
 | **System76 laptop keyboards** with an RGB backlight (tested: Gazelle `gaze15`) | n/a | ✅ colour and brightness, OpenDeviceControl and sound-reactive lighting. Linux only |
 | **Speedlink ACCUSOR** keyboard (SL-670005-BK) | `264a:3008` | ✅ profiles, backlight level and colour, key remapping on all 3 profiles, macros stored in the keyboard, OpenDeviceControl keys |
+| **Bose QuietComfort Headphones** (2023), over Bluetooth | Bluetooth `009e:4075` | ✅ modes, EQ, shortcut button (also as an OpenDeviceControl key), voice prompts, auto-off, multipoint, self voice, battery, paired devices |
+| Other Bose headphones, earbuds and Bluetooth speakers of the Bose Music app (QC Ultra, QC 45, NC 700, QC Earbuds, Ultra Open, SoundLink Flex…) | Bluetooth `009e:*` | 🧪 whatever each model reports: the same settings, plus earbud batteries, in-ear detection, spatial audio, voice assistant and more |
 | K65 RGB / LUX RGB / RGB RAPIDFIRE keyboards | `1b1c:1b17, 1b37, 1b39` | 🧪 per-key lighting, special keys, Win lock |
 | K68 RGB keyboard | `1b1c:1b4f` | 🧪 per-key lighting, special keys, Win lock, polling rate |
 | K70 RGB / LUX RGB / RGB RAPIDFIRE keyboards | `1b1c:1b13, 1b33, 1b38` | 🧪 per-key lighting, special keys, Win lock |
@@ -245,6 +247,36 @@ answer the ACCUSOR's profile query. Protocol notes:
   effect; Fn+F3/F4 still work), Win-key lock (Fn+Win), key response time
   (Fn+F1/F2), gaming mode (Fn+Print Screen).
 - Linux needs the udev rule shipped in `packaging/linux`.
+
+## Bose headphones
+
+Bose headphones, earbuds and Bluetooth speakers that the Bose Music app
+controls, without the app: OpenDeviceControl speaks their Bluetooth protocol
+(BMAP) directly. Tested with the QuietComfort Headphones (2023); other models
+show the settings they report. Protocol notes:
+[reverse-engineering/bose-qc-headphones.md](reverse-engineering/bose-qc-headphones.md).
+
+- Pair and connect the headphones to the computer as usual. OpenDeviceControl
+  finds them by itself once they are connected; they can stay connected to a
+  phone at the same time, and the Bose app on the phone keeps working.
+- **Modes:** switch between Quiet, Aware and your own modes. A mode changed
+  with the headphones' button shows in the app straight away.
+- **Settings:** EQ (bass, mid, treble), the shortcut button, voice prompts
+  and their language, auto-off, multipoint, self voice, and on other models
+  noise cancelling, spatial audio, on-head detection, touch controls and so
+  on. Settings changed from the phone show here within a minute.
+- **Paired devices:** connect or disconnect each paired device and turn on
+  pairing mode. The device the headphones treat as the current source is
+  marked; the volume control changes that device's volume.
+- **Battery** level and charging (per earbud and case on earbuds).
+- **Shortcut button:** set it to "Spotify Tap" and its press and hold becomes
+  a key on the Keys tab that can run any OpenDeviceControl action (type text,
+  run a command, Home Assistant…).
+- Not available: renaming the headphones, creating or deleting modes,
+  firmware updates.
+- Linux: works with BlueZ (any distribution); no udev rule needed. Products
+  that only connect over Bluetooth Low Energy (Bose Wi-Fi speakers, soundbars,
+  L1 Pro / S1 Pro+) are not supported.
 
 ## Sound-reactive lighting
 
