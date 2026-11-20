@@ -426,7 +426,7 @@ impl eframe::App for FerroApp {
                     ui.add_space(40.0);
                     ui.vertical_centered(|ui| {
                         ui.spinner();
-                        ui.label("Looking for supported Corsair devices…");
+                        ui.label("Looking for supported devices…");
                         ui.label(
                             RichText::new(
                                 "On Linux, make sure the udev rule is installed (see README) so OpenDeviceControl can access USB HID devices.",

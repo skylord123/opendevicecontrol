@@ -29,7 +29,7 @@ use parking_lot::RwLock;
 use std::sync::Arc;
 
 const HELP: &str = "\
-opendevicecontrol — open-source Corsair device monitor/controller with Home Assistant integration
+opendevicecontrol — open-source device monitor/controller with Home Assistant integration
 
 USAGE: opendevicecontrol [OPTIONS]
 
@@ -80,7 +80,7 @@ fn probe() {
     probe_ram();
     probe_temperatures();
     match opendevicecontrol_core::discover(&[]) {
-        Ok(devs) if devs.is_empty() => println!("No supported Corsair devices found."),
+        Ok(devs) if devs.is_empty() => println!("No supported devices found."),
         Ok(mut devs) => {
             // Rates (network, disk, CPU load) need a window between two
             // readings, so read once, wait, and print the second reading.
