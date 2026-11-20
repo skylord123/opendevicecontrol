@@ -176,7 +176,7 @@ impl Ids {
         Ids { reserved: held.into_iter().collect(), given: HashSet::new() }
     }
 
-    pub(crate) fn next(&mut self, slug: &'static str) -> String {
+    pub(crate) fn next(&mut self, slug: &str) -> String {
         let id = (1..)
             .map(|n: usize| if n == 1 { slug.to_string() } else { format!("{slug}-{n}") })
             .find(|id| !self.reserved.contains(id) && !self.given.contains(id))
@@ -214,6 +214,7 @@ pub fn discover(held: &[(CString, String)]) -> Result<Vec<(CString, Box<dyn Devi
     crate::vendors::asus::discover(&mut ids, skip_paths, &mut out);
     crate::vendors::system76::discover(&mut ids, skip_paths, &mut out);
     crate::vendors::bose::discover(&mut ids, skip_paths, &mut out);
+    crate::vendors::logitech::discover(&api, &list, &mut ids, skip_paths, &mut out);
     for (_, d) in &out {
         crate::system::tree::own(d.info());
     }
