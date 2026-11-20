@@ -25,4 +25,5 @@ The driver code is under `crates/opendevicecontrol-core/src/vendors/`.
 - [ASUS Aura (ENE) lighting](asus-aura.md): ENE-based ASUS Aura lighting over I2C.
 - [Aula F99 keyboard](aula-f99.md): notes on the Aula F99 keyboard protocol.
 - [Bose QuietComfort Headphones (BMAP)](bose-qc-headphones.md): the Bose Music app's Bluetooth protocol, recovered from the Android app and tested on the headphones, with per-block notes in [bose-bmap/](bose-bmap/).
+- [Logitech HID++ (mice, keyboards, receivers)](logitech-hidpp.md): receiver registers, HID++ 2.0 feature layouts, button diversion and gestures, based on Solaar and tested on an MX Master 3S and a Performance Mouse MX.
 - [Speedlink ACCUSOR keyboard](speedlink-accusor.md): feature commands, key table, onboard macros and events, recovered from the Windows driver and tested on hardware.

@@ -23,6 +23,8 @@ Every device also appears in Home Assistant; see
 | **Speedlink ACCUSOR** keyboard (SL-670005-BK) | `264a:3008` | ✅ profiles, backlight level and colour, key remapping on all 3 profiles, macros stored in the keyboard, OpenDeviceControl keys |
 | **Bose QuietComfort Headphones** (2023), over Bluetooth | Bluetooth `009e:4075` | ✅ modes, EQ, shortcut button (also as an OpenDeviceControl key), voice prompts, auto-off, multipoint, self voice, battery, paired devices |
 | Other Bose headphones, earbuds and Bluetooth speakers of the Bose Music app (QC Ultra, QC 45, NC 700, QC Earbuds, Ultra Open, SoundLink Flex…) | Bluetooth `009e:*` | 🧪 whatever each model reports: the same settings, plus earbud batteries, in-ear detection, spatial audio, voice assistant and more |
+| **Logitech MX Master 3S** (Bluetooth or Bolt receiver), **Performance Mouse MX** (Unifying receiver) | `046d:b034`, `046d:c548`, `046d:c52b` | ✅ DPI, SmartShift, scroll and thumb wheel, button diversion (buttons, gestures and wheels as OpenDeviceControl keys), button remapping, Easy-Switch host, battery, receivers' paired devices |
+| Other Logitech HID++ mice, keyboards and headsets (Unifying, Bolt, Nano, Lightspeed, USB cable, Bluetooth) | `046d:*` | 🧪 whatever each device offers, like Solaar: report rate, onboard profiles, keyboard backlight, Fn keys, disable keys, OS layout, crown, G-keys, haptics, sidetone, EQ; pairing on receivers |
 | K65 RGB / LUX RGB / RGB RAPIDFIRE keyboards | `1b1c:1b17, 1b37, 1b39` | 🧪 per-key lighting, special keys, Win lock |
 | K68 RGB keyboard | `1b1c:1b4f` | 🧪 per-key lighting, special keys, Win lock, polling rate |
 | K70 RGB / LUX RGB / RGB RAPIDFIRE keyboards | `1b1c:1b13, 1b33, 1b38` | 🧪 per-key lighting, special keys, Win lock |
@@ -277,6 +279,32 @@ show the settings they report. Protocol notes:
 - Linux: works with BlueZ (any distribution); no udev rule needed. Products
   that only connect over Bluetooth Low Energy (Bose Wi-Fi speakers, soundbars,
   L1 Pro / S1 Pro+) are not supported.
+
+## Logitech mice, keyboards and receivers
+
+Logitech devices that Solaar or Logi Options+ would control, without either:
+OpenDeviceControl speaks HID++ directly, through a Unifying, Bolt, Nano or
+Lightspeed receiver, on a USB cable or over Bluetooth. Protocol notes:
+[reverse-engineering/logitech-hidpp.md](reverse-engineering/logitech-hidpp.md).
+
+- **Settings** follow what the device offers, in cards: pointer (DPI, pointer
+  speed, report rate), scroll wheel (ratchet, SmartShift, direction, high
+  resolution), thumb wheel, keyboard (backlight, Fn keys, disabled keys, OS
+  layout), device (Easy-Switch computer, onboard profile, haptics, power-off).
+- **Buttons:** each button can stay normal, act as another button (in the
+  device), or be sent to OpenDeviceControl. A sent button becomes a key on the
+  Keys tab that can run any action. Buttons that report movement (the MX
+  gesture button) also offer **mouse gestures** (click, swipe up, down, left
+  and right, each its own key) and **sliding DPI**. Wheels, the crown and
+  G-keys can be sent to OpenDeviceControl the same way.
+- **Battery** level and charging.
+- **Receivers** show their paired devices, can unpair them (Unifying and Bolt),
+  and pair new ones (Bolt shows the passkey to type or click).
+- Devices forget most settings when they sleep or switch off; what you set
+  here is put back each time they connect.
+- Quit Solaar while OpenDeviceControl runs: both would fight over the buttons.
+- Linux: install the udev rules (`packaging/linux/60-opendevicecontrol.rules`)
+  or Solaar's, for access to the receivers and devices.
 
 ## Sound-reactive lighting
 
