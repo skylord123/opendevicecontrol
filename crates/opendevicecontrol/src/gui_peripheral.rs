@@ -253,9 +253,23 @@ impl FerroApp {
             return;
         }
         let cols = if ui.available_width() > 720.0 { 2 } else { 1 };
-        for row in groups.chunks(cols) {
-            ui.columns(cols, |columns| {
-                for (col, (part, items)) in columns.iter_mut().zip(row) {
+        // Masonry: each box goes under the shorter column, so a short box
+        // beside a tall one leaves no gap. Heights are estimated in rows:
+        // the title, one per control, plus its help text.
+        let rows = |items: &[(&Control, &str)]| -> usize {
+            1 + items.iter().map(|(c, _)| 1 + c.help.as_ref().map_or(0, |h| 1 + h.len() / 160)).sum::<usize>()
+        };
+        let mut columns_of: Vec<Vec<usize>> = vec![Vec::new(); cols];
+        let mut heights = vec![0usize; cols];
+        for (i, (_, items)) in groups.iter().enumerate() {
+            let col = (0..cols).min_by_key(|&c| heights[c]).unwrap_or(0);
+            heights[col] += rows(items) + 1;
+            columns_of[col].push(i);
+        }
+        ui.columns(cols, |columns| {
+            for (col, list) in columns.iter_mut().zip(&columns_of) {
+                for &i in list {
+                    let (part, items) = &groups[i];
                     let alias = aliases.get(*part);
                     section(col, "", |ui| {
                         // A renamed zone: its name, and the device's beside it.
@@ -270,10 +284,10 @@ impl FerroApp {
                             self.labeled_control(ui, dev, c, label);
                         }
                     });
+                    col.add_space(4.0);
                 }
-            });
-            ui.add_space(4.0);
-        }
+            }
+        });
     }
 
     /// The device's names of the zones hidden on its page.
