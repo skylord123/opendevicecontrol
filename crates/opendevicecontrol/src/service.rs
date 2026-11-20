@@ -691,7 +691,7 @@ fn worker(h: Handle, state: Arc<Mutex<State>>, mut dev: Box<dyn Device>, rx: Rec
     }
     let mut zones = dev.light_zones();
     let mut layout = dev.led_layout();
-    let keys = dev.input_keys();
+    let mut keys = dev.input_keys();
     h.shared.write().devices.insert(
         id.clone(),
         DeviceView {
@@ -938,9 +938,18 @@ fn worker(h: Handle, state: Arc<Mutex<State>>, mut dev: Box<dyn Device>, rx: Rec
                     let connected = dev.connected();
                     let hardware = dev.hardware();
                     let keymap_info = dev.keymap_info();
+                    // Keys can come and go (a button diverted to OpenDeviceControl).
+                    let new_keys = dev.input_keys();
+                    let keys_changed = !new_keys.iter().map(|k| &k.id).eq(keys.iter().map(|k| &k.id));
+                    if keys_changed {
+                        keys = new_keys;
+                    }
                     let mut s = h.shared.write();
                     if let Some(v) = s.devices.get_mut(&id) {
                         v.online = connected;
+                        if keys_changed {
+                            v.keys = keys.clone();
+                        }
                         v.keymap_info = keymap_info;
                         // Devices that change links (Aula) change their USB ids.
                         v.info = dev.info().clone();
