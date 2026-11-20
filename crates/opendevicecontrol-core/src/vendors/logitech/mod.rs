@@ -124,6 +124,7 @@ pub struct Peripheral {
 }
 
 impl Peripheral {
+    #[allow(clippy::too_many_arguments)]
     fn open(ch: Channel, slot: Option<u8>, id: String, model: String, kind: DeviceKind, pid: u16, serial: Option<String>, registers: u32) -> Peripheral {
         let info = DeviceInfo {
             id: id.clone(),
@@ -369,7 +370,7 @@ impl Peripheral {
             self.connect();
             return;
         }
-        log::trace!("{id}: {} event {} {:02x?}", f::name(feature), r.function(), &r.data);
+        log::trace!("{id}: {} event {} {:02x?}", f::name(feature), r.function(), r.data);
         match feature {
             f::WIRELESS_DEVICE_STATUS if r.function() == 0 => {
                 // Woke up or reconnected; asks for its settings again.

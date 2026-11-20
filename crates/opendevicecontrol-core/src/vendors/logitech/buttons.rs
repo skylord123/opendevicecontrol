@@ -442,7 +442,7 @@ impl Buttons {
                 t.dx += dx / cur * 15.0;
                 t.dy += dy / cur * 15.0;
                 if self.mode(t.cid) == Mode::SlidingDpi {
-                    if let Some(d) = dpi.as_deref_mut() {
+                    if let Some(d) = &mut dpi {
                         self.slide(l, d, &mut t);
                     }
                 }

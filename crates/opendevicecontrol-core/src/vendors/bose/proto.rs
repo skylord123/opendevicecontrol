@@ -257,7 +257,7 @@ pub mod settings {
     }
 
     pub fn range_control(p: &[u8]) -> Vec<Band> {
-        p.chunks_exact(4).map(|c| Band { min: c[0] as i8, max: c[1] as i8, value: c[2] as i8, id: c[3] }).collect()
+        p.as_chunks::<4>().0.iter().map(|c| Band { min: c[0] as i8, max: c[1] as i8, value: c[2] as i8, id: c[3] }).collect()
     }
 
     pub fn set_band(id: u8, value: i8) -> Vec<u8> {
@@ -408,7 +408,7 @@ pub mod status {
     /// Components: 0 the product itself, 1 right bud, 2 left bud, 3 case.
     /// A part that isn't reachable (a bud in a closed case) is left out.
     pub fn batteries(p: &[u8]) -> Vec<(u8, u8, Option<u16>)> {
-        p.chunks_exact(4)
+        p.as_chunks::<4>().0.iter()
             .filter(|c| c[0] <= 100)
             .map(|c| {
                 let m = i16::from_be_bytes([c[1], c[2]]);
@@ -459,7 +459,7 @@ pub mod devices {
     /// of which entries have audio connected (bit n = entry n).
     pub fn list(p: &[u8]) -> Vec<([u8; 6], bool)> {
         let Some((&mask, rest)) = p.split_first() else { return Vec::new() };
-        rest.chunks_exact(6).enumerate().map(|(i, c)| (c.try_into().unwrap(), i < 8 && mask & (1 << i) != 0)).collect()
+        rest.as_chunks::<6>().0.iter().enumerate().map(|(i, c)| (*c, i < 8 && mask & (1 << i) != 0)).collect()
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]

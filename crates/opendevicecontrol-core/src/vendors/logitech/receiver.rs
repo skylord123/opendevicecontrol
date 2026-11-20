@@ -131,7 +131,7 @@ enum Pairing {
     /// Lock open (Unifying-style) or discovering (Bolt), until `until`.
     Waiting,
     /// Bolt: a device answered discovery and pairing was asked for.
-    Pairing { name: String },
+    Requested { name: String },
     /// Bolt: the device must enter this passkey.
     Passkey { name: String, passkey: String, keyboard: bool },
     Done(String),
@@ -281,7 +281,7 @@ impl Receiver {
                         p.push(auth);
                         p.push(entropy);
                         match self.ch.write_register(BOLT_PAIRING, &p) {
-                            Ok(_) => self.pairing = Pairing::Pairing { name },
+                            Ok(_) => self.pairing = Pairing::Requested { name },
                             Err(e) => self.pairing = Pairing::Failed(format!("could not pair {name}: {e}")),
                         }
                     }
@@ -292,7 +292,7 @@ impl Receiver {
             0x4D => {
                 let passkey = String::from_utf8_lossy(r.data.get(0..6).unwrap_or(&[])).to_string();
                 let name = match &self.pairing {
-                    Pairing::Pairing { name } => name.clone(),
+                    Pairing::Requested { name } => name.clone(),
                     _ => "the device".into(),
                 };
                 let keyboard = self.found.is_some_and(|f| f.1 & 0x01 != 0);
@@ -329,7 +329,7 @@ impl Receiver {
         match &self.pairing {
             Pairing::Idle => "Turn on, then switch the new device on (or press its connect button).".into(),
             Pairing::Waiting => format!("Waiting for a device… Switch it on or press its connect button. Stops after {PAIRING_TIMEOUT} seconds."),
-            Pairing::Pairing { name } => format!("Pairing {name}…"),
+            Pairing::Requested { name } => format!("Pairing {name}…"),
             Pairing::Passkey { name, passkey, keyboard: true } => format!("On {name}, type {passkey} and press Enter."),
             Pairing::Passkey { name, passkey, .. } => {
                 let clicks: Vec<&str> =
@@ -370,7 +370,7 @@ impl Device for Receiver {
             self.notify(&r);
         }
         if self.until.is_some_and(|t| Instant::now() >= t) {
-            if matches!(self.pairing, Pairing::Waiting | Pairing::Pairing { .. } | Pairing::Passkey { .. }) {
+            if matches!(self.pairing, Pairing::Waiting | Pairing::Requested { .. } | Pairing::Passkey { .. }) {
                 self.stop_pairing();
                 self.pairing = Pairing::Failed("no device was found".into());
             }
@@ -386,7 +386,7 @@ impl Device for Receiver {
             id: "pair".into(),
             name: "Pairing: Pair a new device".into(),
             kind: ControlKind::Toggle,
-            value: ControlValue::Bool(matches!(self.pairing, Pairing::Waiting | Pairing::Pairing { .. } | Pairing::Passkey { .. })),
+            value: ControlValue::Bool(matches!(self.pairing, Pairing::Waiting | Pairing::Requested { .. } | Pairing::Passkey { .. })),
             help: Some(self.status()),
         }];
         for s in &self.paired {

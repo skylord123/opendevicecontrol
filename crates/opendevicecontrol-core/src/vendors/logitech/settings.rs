@@ -960,9 +960,9 @@ impl Setting for Backlight2 {
                 }
             }
             ("backlight_level", ControlValue::Number(n)) => s.level = *n as u8,
-            ("backlight_hands_out", ControlValue::Number(n)) => s.dho = ((*n as u16) + 4) / 5,
-            ("backlight_hands_in", ControlValue::Number(n)) => s.dhi = ((*n as u16) + 4) / 5,
-            ("backlight_powered", ControlValue::Number(n)) => s.dpow = ((*n as u16) + 4) / 5,
+            ("backlight_hands_out", ControlValue::Number(n)) => s.dho = (*n as u16).div_ceil(5),
+            ("backlight_hands_in", ControlValue::Number(n)) => s.dhi = (*n as u16).div_ceil(5),
+            ("backlight_powered", ControlValue::Number(n)) => s.dpow = (*n as u16).div_ceil(5),
             _ => return Err(Error::InvalidValue(id.into())),
         }
         s.options = (s.options & 0x07) | ((s.mode & 0x03) << 3);
