@@ -3,6 +3,7 @@
 //! adapters (i2c-dev) on Linux.
 
 pub mod ene;
+pub mod aura_usb;
 pub mod gpu;
 
 use crate::devices::{Device, Ids};

@@ -211,6 +211,9 @@ pub fn discover(held: &[(CString, String)]) -> Result<Vec<(CString, Box<dyn Devi
     crate::vendors::aula::discover(&api, &list, &mut ids, skip_paths, &mut out);
     crate::vendors::speedlink::discover(&api, &list, &mut ids, skip_paths, &mut out);
     crate::vendors::asrock::discover(&api, &list, &mut ids, skip_paths, &mut out);
+    crate::vendors::asus::aura_usb::discover(&api, &list, &mut ids, skip_paths, &mut out);
+    crate::vendors::msi::discover(&api, &list, &mut ids, skip_paths, &mut out);
+    crate::vendors::gigabyte::discover(&api, &list, &mut ids, skip_paths, &mut out);
     crate::vendors::asus::discover(&mut ids, skip_paths, &mut out);
     crate::vendors::system76::discover(&mut ids, skip_paths, &mut out);
     crate::vendors::bose::discover(&mut ids, skip_paths, &mut out);
