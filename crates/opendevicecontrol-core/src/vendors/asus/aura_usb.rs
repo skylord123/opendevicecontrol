@@ -148,7 +148,13 @@ impl AuraUsb {
 
     /// Every zone back to its built-in effect; tries them all.
     fn apply_effects(&self) -> Result<()> {
-        (0..self.zones.len()).map(|z| self.apply_effect(z)).fold(Ok(()), |acc, r| acc.and(r))
+        let mut first = Ok(());
+        for z in 0..self.zones.len() {
+            if let Err(e) = self.apply_effect(z) {
+                first = first.and(Err(e));
+            }
+        }
+        first
     }
 
     /// Hand zone `z` to the direct stream.
