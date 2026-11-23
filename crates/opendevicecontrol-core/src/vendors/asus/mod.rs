@@ -1,9 +1,11 @@
 //! ASUS graphics cards' Aura RGB lighting: an ENE controller on the card's
 //! I²C bus, reached through NvAPI on Windows and the NVIDIA driver's i2c
-//! adapters (i2c-dev) on Linux.
+//! adapters (i2c-dev) on Linux. Motherboards' Aura lighting, over the
+//! board's USB LED controller, is in [`aura_usb`].
 
 pub mod ene;
 pub mod aura_usb;
+pub mod aura_usb_proto;
 pub mod gpu;
 
 use crate::devices::{Device, Ids};
