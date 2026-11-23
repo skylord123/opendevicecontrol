@@ -1,4 +1,4 @@
-# opendevicecontrol: give the logged-in user access to Corsair, Aula, Speedlink and Logitech HID devices, and
+# opendevicecontrol: give the logged-in user access to Corsair, Aula, Speedlink, Logitech and ASRock HID devices, and
 # to /dev/uinput for G-key macros (typing keys / text on the user's behalf).
 # Install: sudo cp 60-opendevicecontrol.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger
 
@@ -15,6 +15,9 @@ SUBSYSTEM=="hidraw", ATTRS{idVendor}=="264a", ATTRS{idProduct}=="3008", TAG+="ua
 # Logitech receivers and devices (HID++): on USB, and over Bluetooth
 SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", TAG+="uaccess"
 SUBSYSTEM=="hidraw", KERNELS=="0005:046D:*", TAG+="uaccess"
+
+# ASRock Polychrome RGB: the motherboard's USB lighting controller
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="26ce", ATTRS{idProduct}=="01a2", TAG+="uaccess"
 
 # Corsair RGB memory (experimental; only used when enabled in opendevicecontrol
 # Settings): the chipset SMBus adapters only (Intel i801, AMD PIIX4), never
