@@ -18,6 +18,9 @@ Every device also appears in Home Assistant; see
 | **K55 RGB** keyboard | `1b1c:1b3d` | ✅ lighting, G-keys, Win lock |
 | **Aula F99** keyboard (2.4 GHz receiver or USB cable) | `3554:fa09`, `258a:010c` | ✅ per-key and sound-reactive lighting, built-in effects, battery, key remapping, macros, OS mode, Win-key lock, sleep, debounce. Bluetooth: not supported |
 | **ASRock Polychrome RGB** (motherboard lighting on recent ASRock boards) | `26ce:01a2` | ✅ every zone and addressable header, OpenDeviceControl and sound-reactive lighting, all 18 built-in effects with any colour, apply to all channels, LED counts |
+| ASUS Aura motherboard lighting (AURA LED Controller, AURA MAINBOARD) | `0b05:18f3, 1939, 19af, 1aa6, 1bed, 1867, 1872, 18a3, 18a5` | 🧪 zones the board reports, OpenDeviceControl and sound-reactive lighting, 18 built-in effects with colour, LED counts |
+| MSI Mystic Light motherboard lighting (162- and 185-byte boards, about 2018 to 2024) | `1462:*`, `0db0:0076` | 🧪 zones of about 100 known boards, OpenDeviceControl lighting where the board has a direct mode, built-in effects with colour, speed and brightness, LED counts |
+| Gigabyte RGB Fusion 2 motherboard lighting | `048d:8297, 5702, 5711, 8950` | 🧪 addressable headers and single LEDs, OpenDeviceControl and sound-reactive lighting, built-in effects with colour, speed and brightness, LED counts |
 | **ASUS GeForce RTX 4070 Ti SUPER** lighting (PCI `10de:2705`, subsystem `1043:8957`) | n/a | ✅ all 4 LEDs, OpenDeviceControl and sound-reactive lighting, 14 built-in effects with colour, speed and direction. Linux: 🧪 same protocol, not yet tested on hardware |
 | **System76 laptop keyboards** with an RGB backlight (tested: Gazelle `gaze15`) | n/a | ✅ colour and brightness, OpenDeviceControl and sound-reactive lighting. Linux only |
 | **Speedlink ACCUSOR** keyboard (SL-670005-BK) | `264a:3008` | ✅ profiles, backlight level and colour, key remapping on all 3 profiles, macros stored in the keyboard, OpenDeviceControl keys |
@@ -159,8 +162,8 @@ driver.
 ## ASRock Polychrome RGB
 
 The lighting controller on recent ASRock motherboards (a USB device inside
-the board, `26ce:01a2`). Tested on a B650E board; other boards with this
-controller should work too.
+the board, `26ce:01a2`). Tested on a B650E and a B760M board; other boards
+with this controller should work too.
 
 - **Zones:** whatever the board has of RGB LED 1 and 2, addressable RGB LED
   1 to 3, the PCH heatsink, the I/O cover and the PCB, named as in ASRock's
@@ -176,6 +179,34 @@ controller should work too.
   green for strips that need it. Both are stored on the board.
 - Close ASRock Polychrome RGB first: two programs driving the board at once
   fight over it.
+
+## ASUS, MSI and Gigabyte motherboards (untested)
+
+Drivers for the USB lighting controllers on most ASUS, MSI and Gigabyte
+boards from about 2018 on. They follow the protocol work of OpenRGB (and
+liquidctl for Gigabyte) and have **not been tried on hardware yet**: reports
+from owners are welcome. Protocol notes and open questions are in
+[reverse-engineering/](reverse-engineering/README.md).
+
+- **ASUS Aura** (`0b05:…`): the zones the board's config table lists, 18
+  built-in effects with a colour, OpenDeviceControl lighting on every zone.
+  The board can't report its effect, so the one shown is the last set in
+  OpenDeviceControl. Effects changed here are saved to the board when
+  OpenDeviceControl closes. Set how many LEDs each addressable header has.
+- **MSI Mystic Light** (`1462:…`, `0db0:0076`): boards using the 162- and
+  185-byte protocols (Z390/X399/B450/B460 through X570 and later), with
+  zones from a per-board table. Built-in effects with colour, speed and
+  brightness; OpenDeviceControl lighting where the board has a direct mode.
+  The newest boards with the 761-byte controller (X870, B850, Z890) are not
+  supported.
+- **Gigabyte RGB Fusion 2** (`048d:…`): the addressable (D_LED) headers and
+  the board's single-colour LEDs, with generic names (the controller doesn't
+  say which LEDs a board has). Built-in effects with colour, speed and
+  brightness, and OpenDeviceControl lighting. Effects are not saved to the
+  board; OpenDeviceControl applies them again when it starts.
+- Close the vendor's own utility (Armoury Crate, MSI Center, RGB Fusion /
+  Gigabyte Control Center) first: two programs driving the board fight over
+  it.
 
 ## ASUS graphics cards
 

@@ -1,5 +1,6 @@
-# opendevicecontrol: give the logged-in user access to Corsair, Aula, Speedlink, Logitech and ASRock HID devices, and
-# to /dev/uinput for G-key macros (typing keys / text on the user's behalf).
+# opendevicecontrol: give the logged-in user access to Corsair, Aula, Speedlink
+# and Logitech HID devices and motherboard lighting controllers (ASRock, ASUS,
+# MSI, Gigabyte), and to /dev/uinput for G-key macros (typing keys / text on the user's behalf).
 # Install: sudo cp 60-opendevicecontrol.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger
 
 # All Corsair HID devices (power supplies, keyboards, mice, coolers, hubs…)
@@ -18,6 +19,28 @@ SUBSYSTEM=="hidraw", KERNELS=="0005:046D:*", TAG+="uaccess"
 
 # ASRock Polychrome RGB: the motherboard's USB lighting controller
 SUBSYSTEM=="hidraw", ATTRS{idVendor}=="26ce", ATTRS{idProduct}=="01a2", TAG+="uaccess"
+
+# ASUS Aura motherboard lighting (AURA LED Controller / AURA MAINBOARD)
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0b05", ATTRS{idProduct}=="1867", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0b05", ATTRS{idProduct}=="1872", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0b05", ATTRS{idProduct}=="18a3", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0b05", ATTRS{idProduct}=="18a5", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0b05", ATTRS{idProduct}=="18f3", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0b05", ATTRS{idProduct}=="1939", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0b05", ATTRS{idProduct}=="19af", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0b05", ATTRS{idProduct}=="1aa6", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0b05", ATTRS{idProduct}=="1bed", TAG+="uaccess"
+
+# MSI Mystic Light motherboard lighting: one product id per board model,
+# so all of MSI's USB HID devices, plus the id recent boards share
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1462", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0db0", ATTRS{idProduct}=="0076", TAG+="uaccess"
+
+# Gigabyte RGB Fusion 2 motherboard lighting (ITE controller)
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="048d", ATTRS{idProduct}=="8297", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="048d", ATTRS{idProduct}=="5702", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="048d", ATTRS{idProduct}=="5711", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="048d", ATTRS{idProduct}=="8950", TAG+="uaccess"
 
 # Corsair RGB memory (experimental; only used when enabled in opendevicecontrol
 # Settings): the chipset SMBus adapters only (Intel i801, AMD PIIX4), never

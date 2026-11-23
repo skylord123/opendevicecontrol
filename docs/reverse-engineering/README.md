@@ -23,6 +23,9 @@ The driver code is under `crates/opendevicecontrol-core/src/vendors/`.
 - [Corsair NXP family (shared protocol)](corsair-nxp.md): protocol shared by Corsair devices on NXP firmware.
 - [ASRock Polychrome RGB (USB)](asrock-polychrome.md): USB protocol for ASRock Polychrome RGB controllers.
 - [ASUS Aura (ENE) lighting](asus-aura.md): ENE-based ASUS Aura lighting over I2C.
+- [ASUS Aura motherboard lighting (USB)](asus-aura-usb.md): config table, effects and direct colours of ASUS boards' USB controllers, based on OpenRGB; not tested on hardware.
+- [MSI Mystic Light (USB)](msi-mystic-light.md): the 162- and 185-byte feature-report protocols and per-board zone tables, based on OpenRGB; not tested on hardware.
+- [Gigabyte RGB Fusion 2 (USB)](gigabyte-rgb-fusion2.md): info report, effects and direct colours of Gigabyte's ITE controller, based on liquidctl and OpenRGB; not tested on hardware.
 - [Aula F99 keyboard](aula-f99.md): notes on the Aula F99 keyboard protocol.
 - [Bose QuietComfort Headphones (BMAP)](bose-qc-headphones.md): the Bose Music app's Bluetooth protocol, recovered from the Android app and tested on the headphones, with per-block notes in [bose-bmap/](bose-bmap/).
 - [Logitech HID++ (mice, keyboards, receivers)](logitech-hidpp.md): receiver registers, HID++ 2.0 feature layouts, button diversion and gestures, based on Solaar and tested on an MX Master 3S and a Performance Mouse MX.

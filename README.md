@@ -30,7 +30,7 @@ it to Home Assistant. Nothing did all of that, so I wrote OpenDeviceControl.
 
 **[Supported devices →](docs/devices.md)** Corsair power supplies, keyboards,
 mice, headsets, coolers and RAM, the Aula F99 keyboard, ASRock motherboard
-lighting, ASUS graphics card lighting, System76 laptop keyboards, the
+lighting (ASUS, MSI and Gigabyte boards untested), ASUS graphics card lighting, System76 laptop keyboards, the
 Speedlink ACCUSOR keyboard, Logitech mice and keyboards (HID++, receivers and Bluetooth), Bose headphones over Bluetooth, and the PC's own
 sensors.
 
